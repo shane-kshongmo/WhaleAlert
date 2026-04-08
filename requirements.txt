@@ -1,0 +1,8 @@
+# Whale Alert Service - Dependencies
+httpx>=0.25.0           # 异步 HTTP 客户端 (Binance + Etherscan API)
+fastapi>=0.104.0        # Web 仪表盘 API
+uvicorn>=0.24.0         # ASGI 服务器
+numpy>=1.24.0           # 特征工程
+lightgbm>=4.0.0         # GBDT 预测器
+scikit-learn>=1.3.0     # 数据分割 + 评估指标
+# torch>=2.0.0          # NN 预测器 (取消注释以启用)

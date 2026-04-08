@@ -1,0 +1,358 @@
+"""
+主调度器 (v4 - 并行化)
+
+数据流:
+  采集(10路并发) → 双向分析(控盘+出货同时) → 预警(涨跌并行) → 事件检测(并行) → 学习
+
+运行: python main.py
+"""
+import time
+import json
+import asyncio
+import logging
+import signal
+import sys
+import threading
+from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+
+from config import WATCH_TOKENS, SCAN_INTERVAL_MINUTES, KLINE_INTERVAL
+from data.binance_client import BinanceClient
+from data.onchain_client import OnchainClient
+from data.data_store import DataStore
+from data.token_manager import TokenManager
+from data.auto_discovery import AutoDiscoveryScanner
+from analysis.indicators import calc_indicators
+from analysis.ml_predictor import PredictionManager, extract_features
+from analysis.whale_detector import WhaleDetector, WhaleAnalysis, CrashDetector, CrashAnalysis
+from analysis.alert_engine import AlertEngine
+from analysis.pump_monitor import PumpMonitor
+from analysis.learning_engine import LearningEngine
+from alerts.telegram_bot import TelegramBot
+from alerts.webhook import WebhookNotifier
+from alerts.logger import setup_logging
+
+logger = logging.getLogger(__name__)
+
+
+class WhaleAlertService:
+
+    def __init__(self):
+        self.binance = BinanceClient()
+        self.onchain = OnchainClient()
+        self.store = DataStore()
+        self.detector = WhaleDetector()
+        self.crash_detector = CrashDetector()
+        self.alert_engine = AlertEngine(self.store)
+        self.pump_monitor = PumpMonitor(self.store)
+        self.learning_engine = LearningEngine(self.store, self.pump_monitor)
+        self.token_manager = TokenManager(self.store)
+        self.scanner = AutoDiscoveryScanner(self.store)
+        self.ml = PredictionManager(self.store, model_type="gbdt")
+        self.telegram = TelegramBot()
+        self.webhook = WebhookNotifier()
+
+        self._running = True
+        self._scan_count = 0
+        self._feature_cache: Dict = {}
+
+        self.learning_engine.restore_learned_thresholds()
+        logger.info(f"[Init] 代币:{self.token_manager.get_token_count()} ML:{self.ml.predictor.is_ready()}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 主扫描
+    # ══════════════════════════════════════════════════════════════════
+
+    async def run_scan(self):
+        self._scan_count += 1
+        start = time.time()
+        logger.info(f"{'='*60}")
+        logger.info(f"[Scan #{self._scan_count}] {len(WATCH_TOKENS)} 代币")
+
+        current_prices: Dict = {}
+
+        # ── STEP 0: 自动发现 ──
+        try:
+            disc = await self.scanner.run_discovery()
+            if not disc.get("skipped") and disc.get("added"):
+                await self.telegram.send_message(
+                    f"🔍 发现 {len(disc['added'])} 新代币 | "
+                    f"{', '.join(disc['added'][:8])} | 当前{disc['total']}")
+        except Exception as e:
+            logger.error(f"[Discovery] {e}", exc_info=True)
+
+        # ── STEP 0.5: 全量价格 ──
+        try:
+            current_prices = await self.scanner.get_all_price_changes()
+        except Exception:
+            pass
+
+        token_list = list(WATCH_TOKENS)
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 1: 并发采集 + 双向分析
+        #   每个代币: 1次API → WhaleAnalysis + CrashAnalysis
+        # ══════════════════════════════════════════════════════════════
+        sem = asyncio.Semaphore(10)
+
+        async def analyze_token(tcfg) -> Tuple[Optional[WhaleAnalysis], Optional[CrashAnalysis]]:
+            async with sem:
+                try:
+                    sym = tcfg.symbol
+                    snap = await self.binance.collect_full_snapshot(sym)
+                    klines = snap.get("klines", [])
+                    if not klines or len(klines) < 30:
+                        return None, None
+
+                    ind = calc_indicators(klines, sym)
+                    ob = snap.get("orderbook")
+                    tr = snap.get("trades")
+                    oc = None
+                    if tcfg.contract and tcfg.chain in ("eth", "bsc", "arb"):
+                        try:
+                            oc = await self.onchain.analyze_token(
+                                symbol=sym, contract=tcfg.contract,
+                                chain=tcfg.chain, current_price=ind.price)
+                        except Exception:
+                            pass
+
+                    self.store.cache_klines(sym, KLINE_INTERVAL, klines[-200:])
+                    ob_r = ob.bid_ask_ratio if ob else 0.5
+                    tr_b = tr.buy_ratio if tr else 0.5
+                    ts = int(time.time() * 1000)
+
+                    # 控盘 + 出货: 同一份数据, 零额外开销
+                    whale = self.detector.analyze(
+                        symbol=sym, indicators=ind, onchain=oc,
+                        orderbook_spread=ob.spread_pct if ob else 0,
+                        orderbook_ratio=ob_r,
+                        trade_stats_large_pct=tr.large_trade_pct if tr else 0,
+                        trade_stats_buy_ratio=tr_b, timestamp=ts)
+
+                    crash = self.crash_detector.analyze(
+                        symbol=sym, indicators=ind, onchain=oc,
+                        orderbook_ratio=ob_r, trade_buy_ratio=tr_b, timestamp=ts)
+
+                    # ML校正
+                    ml = self.ml.predict(ind, whale, oc)
+                    if ml["source"] != "rule":
+                        whale.pump_probability = ml["final_prob"]
+                    self._feature_cache[sym] = ml["features"]
+
+                    # 存储
+                    self.store.save_snapshot({
+                        "symbol": sym, "timestamp": ts,
+                        "price": whale.price, "volume_24h": whale.volume_24h,
+                        "change_24h": whale.change_24h,
+                        "control_score": whale.control_score, "phase": whale.phase,
+                        "pump_probability": whale.pump_probability,
+                        "signals": [s.to_dict() for s in whale.signals],
+                        "metrics": whale.to_dict().get("dimensions", {}),
+                    })
+                    current_prices[sym] = {
+                        "price": whale.price,
+                        "change_1h": whale.change_24h * 0.15,
+                        "change_4h": whale.change_24h * 0.4,
+                        "change_24h": whale.change_24h,
+                        "volume_current": whale.volume_24h,
+                        "volume_avg": whale.volume_24h / 1.5,
+                    }
+                    return whale, crash
+                except Exception as e:
+                    logger.error(f"[Scan] {tcfg.symbol}: {e}", exc_info=True)
+                    return None, None
+
+        raw = await asyncio.gather(*[analyze_token(t) for t in token_list], return_exceptions=True)
+
+        all_whales: List[WhaleAnalysis] = []
+        all_crashes: List[CrashAnalysis] = []
+        for r in raw:
+            if isinstance(r, Exception):
+                continue
+            w, c = r if isinstance(r, tuple) else (None, None)
+            if w:
+                all_whales.append(w)
+            if c and c.crash_score > 0:
+                all_crashes.append(c)
+
+        t1 = time.time() - start
+        logger.info(f"[Step1] {t1:.1f}s | 控盘{len(all_whales)} 出货{len(all_crashes)}")
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 2: 预警 — 暴涨 + 暴跌 并行
+        # ══════════════════════════════════════════════════════════════
+        async def _pump_alerts():
+            als = self.alert_engine.evaluate_batch(all_whales)
+            for a in als:
+                await self.telegram.send_alert(a.message)
+                await self.webhook.send(a.message)
+            return als
+
+        async def _crash_alerts():
+            sent = []
+            decs = self.alert_engine.evaluate_crash_batch(all_crashes)
+            for cd in decs:
+                await self.telegram.send_message(cd.message)
+                await self.webhook.send(cd.message)
+                sent.append(cd)
+                co = next((c for c in all_crashes if c.symbol == cd.symbol), None)
+                if co:
+                    self.pump_monitor.save_crash_alert(
+                        cd.symbol, co.crash_score, co.phase, co.crash_probability,
+                        json.dumps([s.to_dict() for s in co.signals]), cd.message)
+            return sent
+
+        pump_alerts, crash_alerts = await asyncio.gather(_pump_alerts(), _crash_alerts())
+        if pump_alerts:
+            logger.warning(f"🚨 {len(pump_alerts)} 暴涨预警")
+        if crash_alerts:
+            logger.warning(f"📉 {len(crash_alerts)} 暴跌预警")
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 3: 事件检测 — 暴涨/暴跌/误报 并行
+        # ══════════════════════════════════════════════════════════════
+        btc = current_prices.get("BTCUSDT", {}).get("change_24h", 0)
+
+        async def _det_pump():
+            evs = self.pump_monitor.check_for_pumps(current_prices, btc)
+            for e in evs:
+                m = self._msg_pump(e)
+                await self.telegram.send_message(m)
+                await self.webhook.send(m)
+            return evs
+
+        async def _det_crash():
+            evs = self.pump_monitor.check_for_crashes(current_prices, btc)
+            for e in evs:
+                m = self._msg_crash(e)
+                await self.telegram.send_message(m)
+                await self.webhook.send(m)
+            return evs
+
+        async def _det_fp():
+            fps = self.pump_monitor.verify_past_alerts(current_prices)
+            for fp in fps:
+                await self.telegram.send_message(self._msg_fp(fp))
+            return fps
+
+        pumps, crashes, fps = await asyncio.gather(_det_pump(), _det_crash(), _det_fp())
+
+        # ══════════════════════════════════════════════════════════════
+        # STEP 4: ML样本 + 学习 + 重训练
+        # ══════════════════════════════════════════════════════════════
+        ps = {e.symbol for e in pumps}
+        for e in pumps:
+            f = self._feature_cache.get(e.symbol)
+            if f is not None:
+                self.ml.record_sample(e.symbol, f, 1, e.pump_pct, 5.0)
+        for fp in fps:
+            f = self._feature_cache.get(fp.get("symbol", ""))
+            if f is not None:
+                self.ml.record_sample(fp["symbol"], f, 0, fp.get("actual_change_24h", 0), 3.0)
+        for a in all_whales:
+            if a.symbol not in ps:
+                f = self._feature_cache.get(a.symbol)
+                if f is not None:
+                    self.ml.record_sample(a.symbol, f, 0, a.change_24h, 1.0)
+
+        if self._scan_count % 6 == 0:
+            try:
+                lesson = self.learning_engine.run_learning_cycle(days=14)
+                if lesson:
+                    m = self._msg_learn(lesson)
+                    await self.telegram.send_message(m)
+                    await self.webhook.send(m)
+            except Exception as e:
+                logger.error(f"[Learning] {e}", exc_info=True)
+
+        if self._scan_count % 12 == 0:
+            try:
+                r = self.ml.maybe_retrain()
+                if r and r.get("trained"):
+                    await self.telegram.send_message(
+                        f"🤖 ML v{self.ml.predictor._model_version} "
+                        f"AUC={r.get('auc',0):.3f} P={r.get('precision',0):.1%} "
+                        f"R={r.get('recall',0):.1%}")
+            except Exception as e:
+                logger.error(f"[ML] {e}", exc_info=True)
+
+        now = datetime.now()
+        if now.hour == 8 and now.minute < SCAN_INTERVAL_MINUTES + 1:
+            await self.telegram.send_message(
+                self.alert_engine.generate_daily_summary(all_whales))
+            await self.telegram.send_message(
+                self.learning_engine.get_status_report(30))
+
+        elapsed = time.time() - start
+        logger.info(
+            f"[Scan #{self._scan_count}] {elapsed:.1f}s (采集{t1:.1f}s) | "
+            f"分析{len(all_whales)} 涨警{len(pump_alerts)} 跌警{len(crash_alerts)} "
+            f"爆涨{len(pumps)} 暴跌{len(crashes)} 误报{len(fps)}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 消息
+    # ══════════════════════════════════════════════════════════════════
+
+    def _msg_pump(self, ev) -> str:
+        h = "✅命中" if ev.was_predicted else "❌漏报"
+        return (f"🚀 爆涨 {ev.symbol} +{ev.pump_pct:.1f}%/{ev.pump_duration_hours}h\n"
+                f"${ev.pump_start_price:,.6g}→${ev.pump_peak_price:,.6g} 量{ev.volume_surge_ratio:.1f}x\n"
+                f"{h} 评分{ev.pre_pump_score}")
+
+    def _msg_crash(self, ev) -> str:
+        h = "✅命中" if ev.was_predicted else "❌漏报"
+        return (f"📉 暴跌 {ev.symbol} {ev.crash_pct:+.1f}%/{ev.crash_duration_hours}h\n"
+                f"${ev.crash_start_price:,.6g}→${ev.crash_bottom_price:,.6g} 量{ev.volume_surge_ratio:.1f}x\n"
+                f"{h} 评分{ev.pre_crash_score}")
+
+    def _msg_learn(self, lesson) -> str:
+        adjs = " | ".join(f"{a['param']}:{a['old']}→{a['new']}" for a in lesson.adjustments[:3])
+        return f"📚 自学习 {lesson.missed_count}漏报 → {adjs or '无调整'}"
+
+    def _msg_fp(self, fp) -> str:
+        return (f"🔕 误报 {fp['symbol']} 评分{fp.get('alert_score',0)} "
+                f"实际{fp.get('actual_change_24h',0):+.1f}% ⚠️已纳入学习")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 生命周期
+    # ══════════════════════════════════════════════════════════════════
+
+    async def run_loop(self):
+        logger.info(
+            f"🐋 Whale Alert v4 启动\n"
+            f"  📡 {self.token_manager.get_token_count()}代币 ⏱{SCAN_INTERVAL_MINUTES}min\n"
+            f"  🚀 涨≥30%/24h 📉 跌≥50%/4h 🔄 并行执行")
+        await self.run_scan()
+        while self._running:
+            try:
+                await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+                if self._running:
+                    await self.run_scan()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[Loop] {e}", exc_info=True)
+                await asyncio.sleep(60)
+        await self.binance.close()
+        await self.onchain.close()
+
+    def stop(self):
+        self._running = False
+
+
+def main():
+    setup_logging()
+    service = WhaleAlertService()
+    signal.signal(signal.SIGINT, lambda *_: service.stop())
+    signal.signal(signal.SIGTERM, lambda *_: service.stop())
+
+    from web.dashboard import start_dashboard, set_managers
+    set_managers(service.token_manager, service.pump_monitor, service.scanner)
+    threading.Thread(target=start_dashboard, daemon=True).start()
+    logger.info(f"📊 Dashboard: http://localhost:8888")
+
+    asyncio.run(service.run_loop())
+
+
+if __name__ == "__main__":
+    main()
