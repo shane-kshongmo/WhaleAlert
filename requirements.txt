@@ -6,3 +6,4 @@ numpy>=1.24.0           # 特征工程
 lightgbm>=4.0.0         # GBDT 预测器
 scikit-learn>=1.3.0     # 数据分割 + 评估指标
 # torch>=2.0.0          # NN 预测器 (取消注释以启用)
+websockets>=12.0        # WebSocket 实时数据流

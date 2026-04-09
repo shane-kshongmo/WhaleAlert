@@ -30,7 +30,7 @@ from data.data_store import DataStore
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://api.binance.com"
+BASE_URL = "https://data-api.binance.vision"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

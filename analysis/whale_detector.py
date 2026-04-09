@@ -59,6 +59,9 @@ class WhaleAnalysis:
     dim_wash_trade: int = 0         # 对倒交易得分
     dim_concentration: int = 0      # 筹码集中得分
     dim_spread: int = 0             # 价差异常得分
+    dim_funding_rate: int = 0       # 资金费率得分
+
+    signal_reliability: float = 0.0      # 0-1 signal reliability score
 
     # 原始数据
     price: float = 0
@@ -76,6 +79,7 @@ class WhaleAnalysis:
             "phase": self.phase,
             "phase_color": self.phase_color,
             "pump_probability": self.pump_probability,
+            "signal_reliability": self.signal_reliability,
             "dimensions": {
                 "accumulation": self.dim_accumulation,
                 "large_orders": self.dim_large_orders,
@@ -84,12 +88,26 @@ class WhaleAnalysis:
                 "wash_trade": self.dim_wash_trade,
                 "concentration": self.dim_concentration,
                 "spread": self.dim_spread,
+                "funding_rate": self.dim_funding_rate,
             },
             "price": self.price,
             "change_24h": self.change_24h,
             "change_7d": self.change_7d,
             "volume_24h": self.volume_24h,
         }
+
+    def get_suggested_sl_tp(self, indicators=None) -> dict:
+        """Suggest stop-loss and take-profit based on volatility and phase"""
+        if indicators and hasattr(indicators, 'atr_pct') and indicators.atr_pct > 0:
+            sl_pct = max(5.0, min(15.0, indicators.atr_pct * 1.5))
+        else:
+            sl_pct = 8.0
+        phase_tp = {"吸筹末期": 20.0, "即将拉盘": 18.0, "高度控盘": 15.0, "持续吸筹中": 12.0, "疑似吸筹": 10.0}
+        tp_pct = phase_tp.get(self.phase, 12.0)
+        if tp_pct / sl_pct < 1.5:
+            tp_pct = sl_pct * 1.5
+        return {"stop_loss_pct": round(sl_pct, 1), "take_profit_pct": round(tp_pct, 1),
+                "risk_reward": round(tp_pct / sl_pct, 2), "reliability": round(self.signal_reliability, 2), "direction": "long"}
 
 
 class WhaleDetector:
@@ -117,6 +135,7 @@ class WhaleDetector:
         trade_stats_large_pct: float = 0,
         trade_stats_buy_ratio: float = 0.5,
         timestamp: int = 0,
+        funding_rate: Optional[float] = None,
     ) -> WhaleAnalysis:
         """执行完整的控盘分析"""
         result = WhaleAnalysis(symbol=symbol, timestamp=timestamp)
@@ -146,15 +165,29 @@ class WhaleDetector:
         # ── 维度 7: 价差异常 ─────────────────────────────────────────────
         self._score_spread(result, orderbook_spread)
 
+        # ── 维度 8: 资金费率 ─────────────────────────────────────────────
+        self._score_funding_rate(result, indicators, funding_rate)
+
         # ── 汇总 ─────────────────────────────────────────────────────────
         result.control_score = min(100, sum(s.score for s in result.signals))
         result.signal_count = len(result.signals)
+
+        # ── Signal Reliability ──
+        unique_dims = len({s.dimension for s in result.signals})
+        result.signal_reliability = min(1.0, unique_dims / 7.0)
+        critical_count = sum(1 for s in result.signals if s.severity == "critical")
+        if critical_count >= 2:
+            result.signal_reliability = min(1.0, result.signal_reliability + 0.2)
+        if result.dim_onchain_flow > 0 and result.dim_imbalance > 0:
+            result.signal_reliability = min(1.0, result.signal_reliability + 0.15)
+        if not any(s.severity in ("critical", "high") for s in result.signals):
+            result.signal_reliability = max(0.0, result.signal_reliability - 0.2)
 
         # ── 阶段判定 ─────────────────────────────────────────────────────
         self._determine_phase(result, indicators, onchain)
 
         # ── 拉盘概率 ─────────────────────────────────────────────────────
-        self._estimate_pump_probability(result, indicators)
+        self._estimate_pump_probability(result, indicators, funding_rate)
 
         logger.info(
             f"[Whale] {symbol}: score={result.control_score}, "
@@ -329,6 +362,31 @@ class WhaleDetector:
         result.dim_spread = score
         result.signals.append(Signal("价差异常", sev, score, desc, spread_pct))
 
+    def _score_funding_rate(self, result: WhaleAnalysis, ind: IndicatorResult, funding_rate: Optional[float]):
+        """资金费率评分 — 负费率+吸筹=拉盘前兆"""
+        if funding_rate is None:
+            return
+        w = MODEL_PARAMS.w_funding
+        has_accumulation = result.dim_accumulation >= 5
+
+        if funding_rate < TH.funding_rate_critical and has_accumulation:
+            score = w.critical_score
+            sev = "critical"
+            desc = f"极端空头费率{funding_rate*100:.3f}%+吸筹信号=拉盘前兆"
+        elif funding_rate < TH.funding_rate_bullish and has_accumulation:
+            score = w.high_score
+            sev = "high"
+            desc = f"空头付费{funding_rate*100:.3f}%+吸筹=看涨"
+        elif funding_rate < TH.funding_rate_bullish:
+            score = w.medium_score
+            sev = "medium"
+            desc = f"轻度空头拥挤: 费率{funding_rate*100:.3f}%"
+        else:
+            return
+
+        result.dim_funding_rate = score
+        result.signals.append(Signal("资金费率", sev, score, desc, funding_rate))
+
     # ── 阶段判定 ─────────────────────────────────────────────────────────
 
     def _determine_phase(self, result: WhaleAnalysis, ind: IndicatorResult, onchain: Optional[OnchainMetrics]):
@@ -368,7 +426,7 @@ class WhaleDetector:
             result.phase = "市场化交易"
             result.phase_color = "#64748b"
 
-    def _estimate_pump_probability(self, result: WhaleAnalysis, ind: IndicatorResult):
+    def _estimate_pump_probability(self, result: WhaleAnalysis, ind: IndicatorResult, funding_rate: Optional[float] = None):
         """基于控盘评分和辅助信号估算短期拉盘概率"""
         mp = MODEL_PARAMS
         base = result.control_score * mp.prob_base_coeff
@@ -382,14 +440,21 @@ class WhaleDetector:
             bonuses += mp.prob_macd_bonus
         if ind.sma7 > ind.sma20 > ind.sma60:
             bonuses += mp.prob_ma_align_bonus
+        if funding_rate is not None and funding_rate < -0.0003:
+            bonuses += 8  # 空头付费 = 拉盘燃料
 
         penalties = 0
         if ind.rsi_14 > 75:
             penalties += mp.prob_overbought_penalty
         if ind.change_7d > 30:
             penalties += mp.prob_already_pumped_penalty
+        if funding_rate is not None and funding_rate > TH.funding_rate_bearish:
+            penalties += 5  # 多头拥挤, 拉盘概率降低
 
         prob = base + bonuses - penalties
+        # Weight by signal reliability
+        if result.signal_reliability > 0:
+            prob = prob * (0.5 + 0.5 * result.signal_reliability)
         result.pump_probability = max(0, min(95, int(prob)))
 
 
@@ -416,6 +481,7 @@ class CrashAnalysis:
     dim_rsi_divergence: int = 0     # RSI顶背离
     dim_ma_death_cross: int = 0     # 均线死叉
     dim_price_breakdown: int = 0    # 跌破关键支撑
+    dim_funding_rate: int = 0       # 资金费率得分
 
     price: float = 0
     change_24h: float = 0
@@ -427,6 +493,19 @@ class CrashAnalysis:
             "phase": self.phase, "crash_probability": self.crash_probability,
             "signals": [s.to_dict() for s in self.signals],
         }
+
+    def get_suggested_short_sl_tp(self, indicators=None) -> dict:
+        """Suggest stop-loss and take-profit for short trades"""
+        if indicators and hasattr(indicators, 'atr_pct') and indicators.atr_pct > 0:
+            sl_pct = max(5.0, min(15.0, indicators.atr_pct * 1.5))
+        else:
+            sl_pct = 8.0
+        phase_tp = {"即将砸盘": 20.0, "高度出货": 18.0, "出货末期": 15.0, "疑似出货": 10.0}
+        tp_pct = phase_tp.get(self.phase, 12.0)
+        if tp_pct / sl_pct < 1.5:
+            tp_pct = sl_pct * 1.5
+        return {"stop_loss_pct": round(sl_pct, 1), "take_profit_pct": round(tp_pct, 1),
+                "risk_reward": round(tp_pct / sl_pct, 2), "reliability": 0.5, "direction": "short"}
 
 
 class CrashDetector:
@@ -446,7 +525,7 @@ class CrashDetector:
     def analyze(
         self, symbol: str, indicators, onchain=None,
         orderbook_ratio: float = 0.5, trade_buy_ratio: float = 0.5,
-        timestamp: int = 0,
+        timestamp: int = 0, funding_rate: Optional[float] = None,
     ) -> CrashAnalysis:
         ind = indicators
         result = CrashAnalysis(symbol=symbol, timestamp=timestamp)
@@ -542,6 +621,20 @@ class CrashDetector:
             result.dim_price_breakdown = s
             result.signals.append(Signal("跌破支撑", sev, s, desc, ind.price))
 
+        # ── 8. 资金费率 (最高8分) ──
+        if funding_rate is not None:
+            has_sell_pressure = result.dim_sell_pressure >= 4
+            if funding_rate > TH.funding_rate_bearish and has_sell_pressure:
+                s = 8; sev = "critical"
+                desc = f"多头拥挤费率{funding_rate*100:.3f}%+抛压=暴跌前兆"
+                result.dim_funding_rate = s
+                result.signals.append(Signal("资金费率", sev, s, desc, funding_rate))
+            elif funding_rate > 0.0005:
+                s = 4; sev = "high"
+                desc = f"多头偏拥挤: 费率{funding_rate*100:.3f}%"
+                result.dim_funding_rate = s
+                result.signals.append(Signal("资金费率", sev, s, desc, funding_rate))
+
         # ── 汇总 ──
         result.crash_score = min(100, sum(s.score for s in result.signals))
         result.signal_count = len(result.signals)
@@ -567,6 +660,10 @@ class CrashDetector:
             base += 8
         if ind.change_7d > 40:
             base += 10  # 已暴涨→更可能暴跌
+        if funding_rate is not None and funding_rate > TH.funding_rate_bearish:
+            base += 8  # 多头拥挤加速暴跌
+        if funding_rate is not None and funding_rate < -0.0005:
+            base -= 5  # 空头拥挤→轧空风险, 降低暴跌概率
         result.crash_probability = max(0, min(95, int(base)))
 
         if result.crash_score > 0:

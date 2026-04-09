@@ -53,6 +53,8 @@ class ModelParams:
         default_factory=lambda: DimensionWeight(max_score=12, critical_score=12, high_score=6, medium_score=2))
     w_spread: DimensionWeight = field(
         default_factory=lambda: DimensionWeight(max_score=8, critical_score=8, high_score=4, medium_score=0))
+    w_funding: DimensionWeight = field(
+        default_factory=lambda: DimensionWeight(max_score=8, critical_score=8, high_score=4, medium_score=2))
 
     # ═══ 拉盘概率模型系数 ═══
     prob_base_coeff: float = 0.55       # 提高 (30%事件比50%常见)
@@ -90,6 +92,8 @@ class ModelParams:
             "筹码集中": self.w_concentration,
             "spread": self.w_spread,
             "价差异常": self.w_spread,
+            "funding": self.w_funding,
+            "资金费率": self.w_funding,
         }
         return mapping.get(dimension)
 
@@ -103,6 +107,7 @@ class ModelParams:
             "wash_trade": "w_wash_trade", "对倒交易": "w_wash_trade",
             "concentration": "w_concentration", "筹码集中": "w_concentration",
             "spread": "w_spread", "价差异常": "w_spread",
+            "funding": "w_funding", "资金费率": "w_funding",
         }
         return mapping.get(dimension, "")
 
@@ -110,7 +115,7 @@ class ModelParams:
         """序列化 (用于持久化)"""
         d = {}
         for dim in ["accumulation", "large_orders", "imbalance", "onchain_flow",
-                     "wash_trade", "concentration", "spread"]:
+                     "wash_trade", "concentration", "spread", "funding"]:
             w = self.get_weight(dim)
             d[f"w_{dim}"] = asdict(w)
         d["prob_base_coeff"] = self.prob_base_coeff
@@ -130,7 +135,7 @@ class ModelParams:
         """从 dict 恢复"""
         params = cls()
         for dim in ["accumulation", "large_orders", "imbalance", "onchain_flow",
-                     "wash_trade", "concentration", "spread"]:
+                     "wash_trade", "concentration", "spread", "funding"]:
             key = f"w_{dim}"
             if key in d and isinstance(d[key], dict):
                 setattr(params, key, DimensionWeight(**d[key]))
@@ -146,7 +151,7 @@ class ModelParams:
         """对比两组参数的差异"""
         lines = []
         for dim in ["accumulation", "large_orders", "imbalance", "onchain_flow",
-                     "wash_trade", "concentration", "spread"]:
+                     "wash_trade", "concentration", "spread", "funding"]:
             w_old = self.get_weight(dim)
             w_new = other.get_weight(dim)
             if w_old.max_score != w_new.max_score:
