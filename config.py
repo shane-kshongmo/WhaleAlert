@@ -110,6 +110,11 @@ class DetectionThresholds:
     # ── 价差异常 ──
     spread_narrow_critical: float = 0.08
 
+    # ── 资金费率 ──
+    funding_rate_bearish: float = 0.001    # >0.1% = 多头拥挤
+    funding_rate_bullish: float = -0.0005  # <-0.05% = 空头拥挤
+    funding_rate_critical: float = -0.001  # <-0.1% = 极端空头
+
     # ══ 出货/暴跌信号阈值 ══
     # 放量暴跌: 突然放量但价格下跌
     dump_vol_surge_critical: float = 4.0   # 成交量突增 4x + 下跌

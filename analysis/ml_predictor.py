@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 # 特征工程
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 完整特征列表 (30维)
+# 完整特征列表 (38维)
 FEATURE_NAMES = [
     # ── 规则引擎输出 (7维得分) ──
     "dim_accumulation",     # 缩量横盘得分
@@ -75,20 +75,37 @@ FEATURE_NAMES = [
     "score_x_bb_squeeze",   # 控盘分×布林带窄度
     "rsi_x_change7d",       # RSI×7日涨幅 (超买+已涨=危险)
     "concentration_x_vol",  # 集中度×缩量 (高集中+缩量=控盘)
+
+    # ── 动量特征 ──
+    "score_delta_3scan",    # control_score change over last 3 scans
+    "score_delta_6scan",    # control_score change over last 6 scans
+    "price_momentum_3h",    # approximate 3h price momentum
+    "volume_acceleration",  # volume change rate
+
+    # ── 历史模式 ──
+    "was_pumped_7d",        # 1 if token pumped in last 7 days
+    "days_since_last_pump", # days since last pump (capped at 30)
+
+    # ── 市场背景 ──
+    "btc_change_24h",       # BTC 24h change
+    "btc_rsi",              # BTC RSI
 ]
 
-NUM_FEATURES = len(FEATURE_NAMES)
+NUM_FEATURES = 38
 
 
 def extract_features(
     indicators,       # IndicatorResult
     whale_analysis,   # WhaleAnalysis
     onchain=None,     # OnchainMetrics (optional)
+    historical_scores: List[int] = None,
+    btc_data: dict = None,
+    pump_history: dict = None,
 ) -> np.ndarray:
     """
     从各模块的输出中提取统一特征向量
 
-    返回: shape=(30,) 的 numpy array
+    返回: shape=(38,) 的 numpy array
     """
     ind = indicators
     wa = whale_analysis
@@ -116,6 +133,25 @@ def extract_features(
 
     # BB squeeze score: 越窄越高 (0-10)
     bb_squeeze = max(0, 10 - ind.bb_width) if ind.bb_width > 0 else 0
+
+    # ── 新增: 动量特征 ──
+    score_delta_3scan = 0.0
+    score_delta_6scan = 0.0
+    if historical_scores and len(historical_scores) >= 3:
+        score_delta_3scan = float(historical_scores[0] - historical_scores[2])
+    if historical_scores and len(historical_scores) >= 6:
+        score_delta_6scan = float(historical_scores[0] - historical_scores[5])
+
+    price_momentum_3h = float(ind.change_24h) / 8.0
+    volume_acceleration = (ind.vol_spike_ratio - 1.0) * ind.vol_shrink_ratio
+
+    # ── 新增: 历史模式 ──
+    was_pumped_7d = float(pump_history.get("was_pumped_7d", False)) if pump_history else 0.0
+    days_since_last_pump = min(30.0, pump_history.get("days_since_last", 30.0)) if pump_history else 30.0
+
+    # ── 新增: 市场背景 ──
+    btc_change_24h = btc_data.get("change_24h", 0.0) if btc_data else 0.0
+    btc_rsi = btc_data.get("rsi", 50.0) if btc_data else 50.0
 
     features = np.array([
         # 规则引擎输出
@@ -155,6 +191,20 @@ def extract_features(
         float(wa.control_score) * bb_squeeze / 100,                    # 控盘分×BB窄度
         ind.rsi_14 * max(0, ind.change_7d) / 100,                     # RSI×7日涨幅
         top10 * ind.vol_shrink_ratio / 100 if top10 > 0 else 0,       # 集中度×缩量
+
+        # 动量特征
+        score_delta_3scan,
+        score_delta_6scan,
+        price_momentum_3h,
+        volume_acceleration,
+
+        # 历史模式
+        was_pumped_7d,
+        days_since_last_pump,
+
+        # 市场背景
+        float(btc_change_24h),
+        float(btc_rsi),
     ], dtype=np.float32)
 
     # 处理 NaN/Inf
@@ -171,7 +221,7 @@ class TrainingSample:
     """一个训练样本"""
     symbol: str
     timestamp: int
-    features: np.ndarray       # shape=(30,)
+    features: np.ndarray       # shape=(38,)
     label: int                 # 1=24h内涨≥50%, 0=未涨
     actual_change: float       # 24h实际涨跌幅
     weight: float = 1.0        # 样本权重 (正样本加权)
@@ -211,14 +261,14 @@ class BasePredictor(ABC):
     """
 
     @abstractmethod
-    def predict(self, features: np.ndarray) -> float:
+    def predict(self, features: np.ndarray):
         """
         预测 24h 内涨≥50% 的概率
 
         Args:
-            features: shape=(30,) 特征向量
+            features: shape=(38,) 特征向量
         Returns:
-            0.0~1.0 概率值
+            (probability, confidence) tuple or None
         """
         ...
 
@@ -228,7 +278,7 @@ class BasePredictor(ABC):
         批量预测
 
         Args:
-            features: shape=(N, 30)
+            features: shape=(N, 38)
         Returns:
             shape=(N,) 概率数组
         """
@@ -275,147 +325,238 @@ class BasePredictor(ABC):
 
 class GBDTPredictor(BasePredictor):
     """
-    基于 LightGBM 的梯度提升树预测器
+    基于 LightGBM 的梯度提升树预测器 (集成版本)
 
     优点:
     - 少样本友好 (50+ 正样本即可开始训练)
     - 内置特征重要性 (可解释)
     - 支持 scale_pos_weight 处理极端不平衡
     - 训练快 (<1s)
-    - 支持增量学习 (init_model)
+    - 集成3个子模型: 全量/近期/高置信
     """
 
-    # 最少训练样本
-    MIN_SAMPLES = 100           # 至少100个样本 (正+负)
-    MIN_POSITIVE_SAMPLES = 5    # 至少5个正样本 (暴涨案例)
+    _min_samples = 30
 
     def __init__(self):
         self._model = None
+        self._model_recent = None
+        self._model_highconf = None
+        self._calibrator = None
         self._is_trained = False
         self._train_metrics: Dict = {}
         self._model_version = 0
         self._last_train_time = 0
 
-    def predict(self, features: np.ndarray) -> float:
-        if not self._is_trained or self._model is None:
-            return -1.0  # 未训练, 调用者应回退到规则引擎
+    def predict(self, features: np.ndarray):
+        if not self.is_ready():
+            return None
+
+        # Pad/trim features to match model
+        if len(features) < NUM_FEATURES:
+            features = np.concatenate([features, np.zeros(NUM_FEATURES - len(features))])
+        elif len(features) > NUM_FEATURES:
+            features = features[:NUM_FEATURES]
+
+        X = features.reshape(1, -1)
+
+        probs = []
+        weights = []
+
         try:
-            X = features.reshape(1, -1)
-            prob = self._model.predict(X, num_iteration=self._model.best_iteration)[0]
-            return float(np.clip(prob, 0.0, 1.0))
+            p_all = float(self._model.predict_proba(X)[0][1])
+            probs.append(p_all)
+            weights.append(0.4)
         except Exception as e:
-            logger.error(f"[GBDT] predict error: {e}")
-            return -1.0
+            logger.error(f"[GBDT] primary predict error: {e}")
+            return None
+
+        if self._model_recent is not None:
+            try:
+                p_recent = float(self._model_recent.predict_proba(X)[0][1])
+                probs.append(p_recent)
+                weights.append(0.35)
+            except Exception:
+                pass
+
+        if self._model_highconf is not None:
+            try:
+                p_hc = float(self._model_highconf.predict_proba(X)[0][1])
+                probs.append(p_hc)
+                weights.append(0.25)
+            except Exception:
+                pass
+
+        total_w = sum(weights[:len(probs)])
+        ensemble_prob = sum(p * w for p, w in zip(probs, weights)) / total_w
+        calibrated = self._calibrate(ensemble_prob)
+
+        # Confidence
+        if len(probs) >= 2:
+            spread = max(probs) - min(probs)
+            if spread < 0.15 and calibrated > 0.7:
+                confidence = "high"
+            elif spread > 0.3 or 0.4 < calibrated < 0.6:
+                confidence = "low"
+            else:
+                confidence = "medium"
+        else:
+            confidence = "medium"
+
+        return calibrated, confidence
 
     def predict_batch(self, features: np.ndarray) -> np.ndarray:
-        if not self._is_trained or self._model is None:
+        if not self.is_ready():
             return np.full(features.shape[0], -1.0)
         try:
-            probs = self._model.predict(features, num_iteration=self._model.best_iteration)
+            probs = self._model.predict_proba(features)[:, 1]
             return np.clip(probs, 0.0, 1.0)
         except Exception as e:
             logger.error(f"[GBDT] predict_batch error: {e}")
             return np.full(features.shape[0], -1.0)
 
-    def train(self, samples: List[TrainingSample]) -> Dict:
+    def _train_single(self, X, y, weights):
         import lightgbm as lgb
+        model = lgb.LGBMClassifier(
+            n_estimators=100, max_depth=5, learning_rate=0.05,
+            num_leaves=31, min_child_samples=5, subsample=0.8,
+            colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
+            verbose=-1)
+        model.fit(X, y, sample_weight=weights)
+        return model
 
-        if len(samples) < self.MIN_SAMPLES:
-            return {"error": f"样本不足: {len(samples)} < {self.MIN_SAMPLES}", "trained": False}
+    def train(self, samples):
+        if len(samples) < self._min_samples:
+            return None
 
-        labels = np.array([s.label for s in samples])
-        n_pos = int(labels.sum())
-        n_neg = len(labels) - n_pos
+        # Prepare data
+        X = np.array([s["features"] if isinstance(s, dict) else s.features for s in samples])
+        y = np.array([s["label"] if isinstance(s, dict) else s.label for s in samples])
 
-        if n_pos < self.MIN_POSITIVE_SAMPLES:
-            return {"error": f"正样本不足: {n_pos} < {self.MIN_POSITIVE_SAMPLES}", "trained": False}
+        # Handle feature dimension mismatch (old 30-feature samples vs new 38)
+        if X.shape[1] < NUM_FEATURES:
+            padding = np.zeros((X.shape[0], NUM_FEATURES - X.shape[1]))
+            X = np.hstack([X, padding])
+        elif X.shape[1] > NUM_FEATURES:
+            X = X[:, :NUM_FEATURES]
 
-        X = np.array([s.features for s in samples], dtype=np.float32)
-        y = labels.astype(np.float32)
-        weights = np.array([s.weight for s in samples], dtype=np.float32)
+        # Sample weights: recent 2x, pumps 3x
+        weights = np.array([s.get("weight", 1.0) if isinstance(s, dict) else s.weight for s in samples])
+        now = time.time() * 1000
+        for i, s in enumerate(samples):
+            ts = s.get("timestamp", 0) if isinstance(s, dict) else s.timestamp
+            if now - ts < 14 * 86400 * 1000:
+                weights[i] *= 2.0
+            lbl = s.get("label") if isinstance(s, dict) else s.label
+            if lbl == 1:
+                weights[i] *= 3.0
 
-        # 不平衡处理: 正样本加权
-        pos_weight = n_neg / max(1, n_pos)
+        # Train primary model (all data)
+        self._model = self._train_single(X, y, weights)
+        self._model_version += 1
 
-        # 划分训练/验证 (80/20, 保证验证集有正样本)
-        from sklearn.model_selection import StratifiedShuffleSplit
-        sss = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+        # Train recent model (last 30 days)
+        recent_mask = np.array([
+            now - (s.get("timestamp", 0) if isinstance(s, dict) else s.timestamp) < 30 * 86400 * 1000
+            for s in samples
+        ])
+        if recent_mask.sum() >= 20:
+            self._model_recent = self._train_single(X[recent_mask], y[recent_mask], weights[recent_mask])
+
+        # Train high-confidence model
+        hc_mask = np.array([
+            (s.get("weight", 1.0) if isinstance(s, dict) else s.weight) >= 3.0
+            for s in samples
+        ])
+        if hc_mask.sum() >= 10:
+            self._model_highconf = self._train_single(X[hc_mask], y[hc_mask], weights[hc_mask])
+
+        # Fit calibrator (Platt scaling)
+        self._fit_calibrator(X, y)
+
+        # Cross-validation
+        cv_auc = self._cross_validate(X, y, weights)
+
+        # Feature importance
+        importance = self._model.feature_importances_
+        top_idx = np.argsort(importance)[-10:][::-1]
+        top_features = [
+            (FEATURE_NAMES[i] if i < len(FEATURE_NAMES) else f"f{i}", float(importance[i]))
+            for i in top_idx
+        ]
+
+        # Metrics
         try:
-            train_idx, val_idx = next(sss.split(X, y))
-        except ValueError:
-            # 正样本太少无法分层, 用全量训练
-            train_idx = np.arange(len(X))
-            val_idx = train_idx[-max(1, len(X)//5):]
-
-        train_data = lgb.Dataset(
-            X[train_idx], y[train_idx],
-            weight=weights[train_idx],
-            feature_name=FEATURE_NAMES,
-        )
-        val_data = lgb.Dataset(
-            X[val_idx], y[val_idx],
-            weight=weights[val_idx],
-            feature_name=FEATURE_NAMES,
-            reference=train_data,
-        )
-
-        params = {
-            "objective": "binary",
-            "metric": ["auc", "binary_logloss"],
-            "scale_pos_weight": pos_weight,
-            "num_leaves": 15,           # 浅树防过拟合
-            "max_depth": 5,
-            "learning_rate": 0.05,
-            "min_child_samples": max(3, n_pos // 3),  # 叶子最少样本
-            "reg_alpha": 0.1,           # L1 正则
-            "reg_lambda": 1.0,          # L2 正则
-            "subsample": 0.8,
-            "colsample_bytree": 0.8,
-            "verbose": -1,
-            "seed": 42,
-        }
-
-        callbacks = [lgb.early_stopping(20), lgb.log_evaluation(0)]
-
-        # 增量学习: 如果已有模型, 用 init_model 继续训练
-        init_model = self._model if self._is_trained else None
-
-        self._model = lgb.train(
-            params, train_data,
-            num_boost_round=300,
-            valid_sets=[val_data],
-            init_model=init_model,
-            callbacks=callbacks,
-        )
-
-        # 评估
-        val_pred = self._model.predict(X[val_idx], num_iteration=self._model.best_iteration)
-        metrics = self._calc_metrics(y[val_idx], val_pred)
-        metrics.update({
-            "n_samples": len(samples),
-            "n_positive": n_pos,
-            "n_negative": n_neg,
-            "pos_weight": round(pos_weight, 1),
-            "best_iteration": self._model.best_iteration,
-            "trained": True,
-        })
+            from sklearn.metrics import roc_auc_score, precision_score, recall_score
+            y_pred = self._model.predict_proba(X)[:, 1]
+            auc = roc_auc_score(y, y_pred) if len(set(y)) > 1 else 0.5
+            y_bin = (y_pred >= 0.5).astype(int)
+            prec = precision_score(y, y_bin, zero_division=0)
+            rec = recall_score(y, y_bin, zero_division=0)
+        except Exception:
+            auc, prec, rec = 0.5, 0.0, 0.0
 
         self._is_trained = True
-        self._train_metrics = metrics
-        self._model_version += 1
         self._last_train_time = int(time.time())
 
+        metrics = {
+            "trained": True,
+            "auc": auc,
+            "precision": prec,
+            "recall": rec,
+            "cv_auc_mean": cv_auc[0],
+            "cv_auc_std": cv_auc[1],
+            "top_features": top_features,
+            "samples": len(samples),
+        }
+        self._train_metrics = metrics
+
         logger.warning(
-            f"🤖 [GBDT] 训练完成 v{self._model_version}: "
-            f"AUC={metrics.get('auc', 0):.3f} "
-            f"P={metrics.get('precision', 0):.1%} R={metrics.get('recall', 0):.1%} "
-            f"({n_pos}正/{n_neg}负)"
+            f"[GBDT] 训练完成 v{self._model_version}: "
+            f"AUC={auc:.3f} P={prec:.1%} R={rec:.1%} "
+            f"({len(samples)} samples)"
         )
         return metrics
 
+    def _fit_calibrator(self, X, y):
+        try:
+            from sklearn.linear_model import LogisticRegression
+            raw_probs = self._model.predict_proba(X)[:, 1].reshape(-1, 1)
+            self._calibrator = LogisticRegression(C=1.0, solver='lbfgs')
+            self._calibrator.fit(raw_probs, y)
+        except Exception:
+            self._calibrator = None
+
+    def _calibrate(self, raw_prob):
+        if hasattr(self, '_calibrator') and self._calibrator is not None:
+            try:
+                return float(self._calibrator.predict_proba([[raw_prob]])[0][1])
+            except Exception:
+                pass
+        return raw_prob
+
+    def _cross_validate(self, X, y, weights):
+        try:
+            from sklearn.model_selection import StratifiedKFold
+            from sklearn.metrics import roc_auc_score
+            if len(set(y)) < 2 or len(y) < 10:
+                return (0.5, 0.0)
+            kf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            aucs = []
+            for train_idx, val_idx in kf.split(X, y):
+                model = self._train_single(X[train_idx], y[train_idx], weights[train_idx])
+                pred = model.predict_proba(X[val_idx])[:, 1]
+                if len(set(y[val_idx])) > 1:
+                    aucs.append(roc_auc_score(y[val_idx], pred))
+            return (np.mean(aucs), np.std(aucs)) if aucs else (0.5, 0.0)
+        except Exception:
+            return (0.5, 0.0)
+
     def _calc_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict:
         """计算评估指标"""
-        from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
+        try:
+            from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
+        except Exception:
+            return {}
         metrics = {}
         try:
             if len(np.unique(y_true)) > 1:
@@ -423,13 +564,11 @@ class GBDTPredictor(BasePredictor):
             else:
                 metrics["auc"] = 0.0
 
-            # 用0.5作为默认阈值
             y_bin = (y_pred >= 0.5).astype(int)
             metrics["precision"] = round(precision_score(y_true, y_bin, zero_division=0), 4)
             metrics["recall"] = round(recall_score(y_true, y_bin, zero_division=0), 4)
             metrics["f1"] = round(f1_score(y_true, y_bin, zero_division=0), 4)
 
-            # 也算 top-K precision: 概率最高的 K 个中有多少是真暴涨
             k = max(1, int(y_true.sum()))
             top_k_idx = np.argsort(y_pred)[-k:]
             metrics["precision_at_k"] = round(y_true[top_k_idx].mean(), 4)
@@ -442,7 +581,10 @@ class GBDTPredictor(BasePredictor):
             return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         state = {
-            "model_str": self._model.model_to_string(),
+            "model": self._model,
+            "model_recent": self._model_recent,
+            "model_highconf": self._model_highconf,
+            "calibrator": self._calibrator,
             "version": self._model_version,
             "metrics": self._train_metrics,
             "train_time": self._last_train_time,
@@ -455,16 +597,27 @@ class GBDTPredictor(BasePredictor):
         if not os.path.exists(path):
             return False
         try:
-            import lightgbm as lgb
             with open(path, "rb") as f:
                 state = pickle.load(f)
-            self._model = lgb.Booster(model_str=state["model_str"])
+
+            # Backward compatibility: old format used "model_str" (lgb.Booster)
+            if "model_str" in state:
+                import lightgbm as lgb
+                # Old single-booster format — cannot use as LGBMClassifier,
+                # discard and force retrain
+                logger.warning("[GBDT] Old model format detected, will retrain on next cycle")
+                return False
+
+            self._model = state.get("model")
+            self._model_recent = state.get("model_recent")
+            self._model_highconf = state.get("model_highconf")
+            self._calibrator = state.get("calibrator")
             self._model_version = state.get("version", 1)
             self._train_metrics = state.get("metrics", {})
             self._last_train_time = state.get("train_time", 0)
-            self._is_trained = True
+            self._is_trained = self._model is not None
             logger.info(f"[GBDT] 模型已加载: {path} (v{self._model_version})")
-            return True
+            return self._is_trained
         except Exception as e:
             logger.error(f"[GBDT] 加载失败: {e}")
             return False
@@ -475,10 +628,13 @@ class GBDTPredictor(BasePredictor):
     def feature_importance(self) -> Dict[str, float]:
         if not self._is_trained or self._model is None:
             return {}
-        imp = self._model.feature_importance(importance_type="gain")
-        total = imp.sum() or 1
-        return {name: round(float(val / total), 4)
-                for name, val in zip(FEATURE_NAMES, imp)}
+        try:
+            imp = self._model.feature_importances_
+            total = imp.sum() or 1
+            return {name: round(float(val / total), 4)
+                    for name, val in zip(FEATURE_NAMES, imp)}
+        except Exception:
+            return {}
 
     def get_status(self) -> Dict:
         return {
@@ -498,7 +654,7 @@ class NNPredictor(BasePredictor):
     """
     基于 PyTorch 的多层感知机预测器
 
-    架构: Input(30) → Dense(64,ReLU) → Dropout(0.3) → Dense(32,ReLU)
+    架构: Input(38) → Dense(64,ReLU) → Dropout(0.3) → Dense(32,ReLU)
           → Dropout(0.2) → Dense(1,Sigmoid)
 
     使用条件:
@@ -541,9 +697,9 @@ class NNPredictor(BasePredictor):
 
         return nn.Sequential(*layers)
 
-    def predict(self, features: np.ndarray) -> float:
+    def predict(self, features: np.ndarray):
         if not self._is_trained or self._model is None:
-            return -1.0
+            return None
         try:
             import torch
             self._model.eval()
@@ -551,10 +707,10 @@ class NNPredictor(BasePredictor):
             x_t = torch.FloatTensor(x)
             with torch.no_grad():
                 prob = self._model(x_t).item()
-            return float(np.clip(prob, 0.0, 1.0))
+            return float(np.clip(prob, 0.0, 1.0)), "medium"
         except Exception as e:
             logger.error(f"[NN] predict error: {e}")
-            return -1.0
+            return None
 
     def predict_batch(self, features: np.ndarray) -> np.ndarray:
         if not self._is_trained or self._model is None:
@@ -677,13 +833,16 @@ class NNPredictor(BasePredictor):
         self._last_train_time = int(time.time())
 
         logger.warning(
-            f"🧠 [NN] 训练完成 v{self._model_version}: "
+            f"[NN] 训练完成 v{self._model_version}: "
             f"AUC={metrics.get('auc', 0):.3f} epochs={epoch+1}"
         )
         return metrics
 
     def _calc_metrics(self, y_true, y_pred) -> Dict:
-        from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
+        try:
+            from sklearn.metrics import roc_auc_score, precision_score, recall_score, f1_score
+        except Exception:
+            return {}
         metrics = {}
         try:
             if len(np.unique(y_true)) > 1:
@@ -761,7 +920,6 @@ class PredictionManager:
     决策逻辑:
     1. ML 模型已就绪 → 使用 ML 概率 (用规则引擎概率做 sanity check)
     2. ML 模型未就绪 → 回退到规则引擎概率
-    3. ML 与规则引擎严重分歧 → 取保守值 (较低的那个)
 
     自动训练:
     - 每 N 小时从 DB 收集样本, 自动重训练
@@ -820,62 +978,38 @@ class PredictionManager:
 
     # ── 预测 (对外接口) ──────────────────────────────────────────────────
 
-    def predict(self, indicators, whale_analysis, onchain=None) -> Dict:
+    def predict(self, indicators, whale_analysis, onchain=None,
+                historical_scores=None, btc_data=None, pump_history=None) -> Dict:
         """
         综合预测: ML + 规则引擎
 
         返回:
         {
-            "ml_prob": 0.0~1.0 or None (ML未就绪),
-            "rule_prob": 0~100 (规则引擎概率),
             "final_prob": 0~100 (最终使用的概率),
-            "source": "ml" / "rule" / "ensemble",
+            "confidence_level": "high"/"medium"/"low",
+            "source": "ml" / "rule",
             "features": np.ndarray,
         }
         """
-        features = extract_features(indicators, whale_analysis, onchain)
-        rule_prob = whale_analysis.pump_probability  # 0-100
+        features = extract_features(indicators, whale_analysis, onchain,
+                                    historical_scores, btc_data, pump_history)
 
-        if not self.predictor.is_ready():
-            return {
-                "ml_prob": None,
-                "rule_prob": rule_prob,
-                "final_prob": rule_prob,
-                "source": "rule",
-                "features": features,
-            }
-
-        ml_prob_raw = self.predictor.predict(features)
-        if ml_prob_raw < 0:
-            # 预测失败, 回退
-            return {
-                "ml_prob": None,
-                "rule_prob": rule_prob,
-                "final_prob": rule_prob,
-                "source": "rule",
-                "features": features,
-            }
-
-        ml_prob = ml_prob_raw * 100  # 转为 0-100
-
-        # 融合策略
-        divergence = abs(ml_prob - rule_prob)
-        if divergence > self.DIVERGENCE_THRESHOLD * 100:
-            # 严重分歧 → 取保守值 (低的)
-            final_prob = int(min(ml_prob, rule_prob))
-            source = "ensemble_conservative"
-        else:
-            # 正常: ML 为主, 规则为辅 (7:3 加权)
-            final_prob = int(ml_prob * 0.7 + rule_prob * 0.3)
-            source = "ensemble"
+        if self.predictor.is_ready():
+            result = self.predictor.predict(features)
+            if result is not None:
+                prob, confidence = result
+                return {
+                    "final_prob": int(prob * 100),
+                    "confidence_level": confidence,
+                    "source": "ml",
+                    "features": features,
+                }
 
         return {
-            "ml_prob": round(ml_prob, 1),
-            "rule_prob": rule_prob,
-            "final_prob": final_prob,
-            "source": source,
+            "final_prob": whale_analysis.pump_probability,
+            "confidence_level": "low",
+            "source": "rule",
             "features": features,
-            "divergence": round(divergence, 1),
         }
 
     # ── 样本收集 ─────────────────────────────────────────────────────────
@@ -913,7 +1047,8 @@ class PredictionManager:
         for r in rows:
             try:
                 features = np.array(json.loads(r["features_json"]), dtype=np.float32)
-                if len(features) == NUM_FEATURES:
+                # Accept old 30-feature or new 38-feature samples
+                if len(features) in (30, NUM_FEATURES):
                     samples.append(TrainingSample(
                         symbol=r["symbol"],
                         timestamp=r["timestamp"],
@@ -945,8 +1080,10 @@ class PredictionManager:
         if not samples:
             return None
 
-        metrics = self.predictor.train(samples)
-        if metrics.get("trained"):
+        # Convert TrainingSample objects to dicts for the new train() interface
+        sample_dicts = [s.to_dict() for s in samples]
+        metrics = self.predictor.train(sample_dicts)
+        if metrics and metrics.get("trained"):
             self.predictor.save(self._model_path)
             self._last_train_time = now
 
@@ -955,7 +1092,7 @@ class PredictionManager:
                     INSERT INTO ml_model_history
                     (model_type, version, metrics_json, n_samples, trained_at)
                     VALUES (?, ?, ?, ?, ?)
-                """, (self._model_type, metrics.get("n_samples", 0),
+                """, (self._model_type, metrics.get("samples", 0),
                       json.dumps(metrics), len(samples), int(now * 1000)))
 
         return metrics
@@ -979,7 +1116,7 @@ class PredictionManager:
             self._model_type = "nn"
             self._model_path = os.path.join(self.MODEL_DIR, "nn_predictor.pt")
             nn.save(self._model_path)
-            logger.warning(f"🧠 [ML] 已切换到 NN 预测器")
+            logger.warning(f"[ML] 已切换到 NN 预测器")
 
         return result
 

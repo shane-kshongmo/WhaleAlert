@@ -11,6 +11,7 @@ import time
 import json
 import logging
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 from dataclasses import dataclass, field
 
 from data.data_store import DataStore
@@ -509,6 +510,46 @@ class PumpMonitor:
                 ORDER BY alert_timestamp DESC
             """, (cutoff,)).fetchall()
             return [dict(r) for r in rows]
+
+    def get_fp_dimension_analysis(self, days: int = 30) -> Dict[str, float]:
+        """Which signal dimensions appear more in false positives vs true positives"""
+        fps = self.get_false_positives(days)
+        fp_dims = Counter()
+        for fp in fps:
+            try:
+                signals = json.loads(fp.get("alert_signals_json", "[]"))
+                for sig in signals:
+                    dim = sig.get("dimension", "")
+                    if dim:
+                        fp_dims[dim] += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        tp_dims = Counter()
+        cutoff = int((time.time() - days * 86400) * 1000)
+        with self.store._conn() as conn:
+            pumps = conn.execute(
+                "SELECT pre_pump_signals_json FROM pump_events WHERE detected_at >= ? AND was_predicted = 1",
+                (cutoff,)).fetchall()
+        for p in pumps:
+            try:
+                signals = json.loads(p["pre_pump_signals_json"])
+                for sig in signals:
+                    dim = sig.get("dimension", "")
+                    if dim:
+                        tp_dims[dim] += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        all_dims = set(list(fp_dims.keys()) + list(tp_dims.keys()))
+        result = {}
+        for dim in all_dims:
+            fp_c = fp_dims.get(dim, 0)
+            tp_c = tp_dims.get(dim, 0)
+            total = fp_c + tp_c
+            if total > 0:
+                result[dim] = fp_c / total
+        return result
 
     def get_full_stats(self, days: int = 30) -> Dict:
         """完整统计: 命中 + 漏报 + 误报"""

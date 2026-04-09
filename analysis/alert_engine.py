@@ -10,8 +10,10 @@
 5. 冷却期: 同一代币 4 小时内不重复
 """
 import time
+import json
 import logging
-from typing import List, Optional
+from typing import List, Dict, Optional
+from collections import Counter
 from dataclasses import dataclass
 
 from config import ALERT_CONFIG as AC, CRASH_ALERT_CONFIG as CAC
@@ -19,6 +21,61 @@ from analysis.whale_detector import WhaleAnalysis, CrashAnalysis
 from data.data_store import DataStore
 
 logger = logging.getLogger(__name__)
+
+
+class AdaptiveThresholds:
+    """Per-token threshold adjustments based on historical accuracy"""
+    def __init__(self, store: DataStore):
+        self.store = store
+        self._adjustments: Dict[str, dict] = {}
+        self._init_table()
+        self._load()
+
+    def _init_table(self):
+        with self.store._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS adaptive_thresholds (
+                    symbol TEXT PRIMARY KEY,
+                    score_adjustment INTEGER DEFAULT 0,
+                    reason TEXT,
+                    updated_at INTEGER,
+                    expires_at INTEGER
+                )
+            """)
+
+    def _load(self):
+        now = int(time.time() * 1000)
+        with self.store._conn() as conn:
+            rows = conn.execute("SELECT * FROM adaptive_thresholds WHERE expires_at > ?", (now,)).fetchall()
+            for r in rows:
+                self._adjustments[r["symbol"]] = {
+                    "score_adj": r["score_adjustment"],
+                    "expires": r["expires_at"] / 1000,
+                    "reason": r["reason"]
+                }
+
+    def _save(self, symbol: str):
+        adj = self._adjustments.get(symbol, {})
+        with self.store._conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO adaptive_thresholds (symbol, score_adjustment, reason, updated_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (symbol, adj.get("score_adj", 0), adj.get("reason", ""),
+                  int(time.time() * 1000), int(adj.get("expires", 0) * 1000)))
+
+    def get_adjusted_min_score(self, symbol: str, base_score: int) -> int:
+        adj = self._adjustments.get(symbol, {})
+        if adj and adj.get("expires", 0) > time.time():
+            return base_score + adj.get("score_adj", 0)
+        return base_score
+
+    def record_false_positive(self, symbol: str):
+        self._adjustments[symbol] = {"score_adj": 10, "expires": time.time() + 7 * 86400, "reason": "recent_fp"}
+        self._save(symbol)
+
+    def record_hit(self, symbol: str):
+        self._adjustments[symbol] = {"score_adj": -5, "expires": time.time() + 3 * 86400, "reason": "recent_hit"}
+        self._save(symbol)
 
 
 @dataclass
@@ -29,17 +86,39 @@ class AlertDecision:
     urgency: str = "normal"
     message: str = ""
     analysis: Optional[WhaleAnalysis] = None
+    trade_signal: dict = None
 
 
 class AlertEngine:
     def __init__(self, store: DataStore):
         self.store = store
+        self.adaptive = AdaptiveThresholds(store)
+        self._watchlist: Dict[str, dict] = {}
 
-    def evaluate(self, analysis: WhaleAnalysis) -> AlertDecision:
+    def _cleanup_watchlist(self):
+        """Remove watchlist entries older than 2 hours"""
+        cutoff = time.time() - 2 * 3600
+        expired = [sym for sym, entry in self._watchlist.items() if entry.get("added_at", 0) < cutoff]
+        for sym in expired:
+            del self._watchlist[sym]
+
+    def evaluate(self, analysis: WhaleAnalysis, score_boost: int = 0, ml_confidence: str = "medium") -> AlertDecision:
         decision = AlertDecision(symbol=analysis.symbol, analysis=analysis)
+        symbol = analysis.symbol
 
-        if analysis.control_score < AC.min_control_score:
-            decision.reason = f"控盘分不足: {analysis.control_score} < {AC.min_control_score}"
+        # ML confidence gating: adjust base minimum score
+        if ml_confidence == "high":
+            base_min = max(60, AC.min_control_score - 10)
+        elif ml_confidence == "low":
+            base_min = AC.min_control_score + 15
+        else:
+            base_min = AC.min_control_score
+
+        # Apply adaptive threshold + score boost
+        effective_min = self.adaptive.get_adjusted_min_score(symbol, base_min) + score_boost
+
+        if analysis.control_score < effective_min:
+            decision.reason = f"控盘分不足: {analysis.control_score} < {effective_min}"
             return decision
 
         if analysis.phase not in AC.required_phases:
@@ -54,25 +133,72 @@ class AlertEngine:
             decision.reason = f"概率不足: {analysis.pump_probability}% < {AC.min_pump_probability}%"
             return decision
 
-        last_alert_ts = self.store.get_last_alert_time(analysis.symbol)
+        last_alert_ts = self.store.get_last_alert_time(symbol)
         if last_alert_ts:
             hours_since = (time.time() * 1000 - last_alert_ts) / 3600000
             if hours_since < AC.cooldown_hours:
                 decision.reason = f"冷却中: {hours_since:.1f}h < {AC.cooldown_hours}h"
                 return decision
 
+        # 2-stage confirmation watchlist
+        self._cleanup_watchlist()
+        now = time.time()
+        existing = self._watchlist.get(symbol)
+        if existing is None:
+            # Stage 1: first time meeting thresholds, add to watchlist
+            self._watchlist[symbol] = {
+                "added_at": now,
+                "scan_count": 1,
+                "last_score": analysis.control_score,
+            }
+            decision.reason = "Stage 1: Watching"
+            logger.debug(f"[Alert] {symbol}: 加入观察列表 score={analysis.control_score}")
+            return decision
+        else:
+            scan_count = existing.get("scan_count", 1) + 1
+            last_score = existing.get("last_score", analysis.control_score)
+            score_delta = analysis.control_score - last_score
+            self._watchlist[symbol]["scan_count"] = scan_count
+            self._watchlist[symbol]["last_score"] = analysis.control_score
+
+            if score_delta < -5:
+                # Signal weakened — cancel watch
+                del self._watchlist[symbol]
+                decision.reason = f"信号减弱: delta={score_delta}"
+                logger.debug(f"[Alert] {symbol}: 信号减弱, 取消观察")
+                return decision
+
+            # Stage 2: confirmed, fire alert
+            del self._watchlist[symbol]
+
         decision.should_alert = True
         decision.urgency = "critical" if analysis.control_score >= 85 else "high"
         decision.message = self._build_message(analysis)
         decision.reason = "全部条件满足"
+        if hasattr(analysis, 'signal_reliability') and analysis.signal_reliability >= 0.4:
+            decision.trade_signal = analysis.get_suggested_sl_tp()
 
-        logger.warning(f"🚨 [ALERT] {analysis.symbol}: score={analysis.control_score}, phase={analysis.phase}, pump={analysis.pump_probability}%")
+        logger.warning(f"🚨 [ALERT] {symbol}: score={analysis.control_score}, phase={analysis.phase}, pump={analysis.pump_probability}%")
         return decision
 
+    def _check_market_correlation(self, analyses: List[WhaleAnalysis]) -> float:
+        """Return correlation score (0-1): fraction of tokens showing correlated moves"""
+        if not analyses:
+            return 0.0
+        total = len(analyses)
+        high_control = sum(1 for a in analyses if a.control_score >= 40)
+        big_move = sum(1 for a in analyses if abs(a.change_24h) > 5)
+        return max(high_control / total, big_move / total)
+
     def evaluate_batch(self, analyses: List[WhaleAnalysis]) -> List[AlertDecision]:
+        correlation = self._check_market_correlation(analyses)
+        score_boost = 15 if correlation > 0.5 else 0
+        if score_boost:
+            logger.info(f"[Alert] 市场相关性 {correlation:.2f} > 0.5, score_boost=+{score_boost}")
+
         results = []
         for a in analyses:
-            decision = self.evaluate(a)
+            decision = self.evaluate(a, score_boost=score_boost)
             if decision.should_alert:
                 results.append(decision)
                 self.store.save_alert({
@@ -139,7 +265,7 @@ class AlertEngine:
 ⚠️ 高控盘=高风险, 不构成投资建议
 ━━━━━━━━━━━━━━━━━━━""".strip()
 
-    def generate_daily_summary(self, analyses: List[WhaleAnalysis]) -> str:
+    def generate_daily_summary(self, analyses: List[WhaleAnalysis], pump_monitor=None) -> str:
         sorted_a = sorted(analyses, key=lambda x: -x.control_score)
         critical = [a for a in sorted_a if a.control_score >= 70]
         medium = [a for a in sorted_a if 50 <= a.control_score < 70]
@@ -162,6 +288,19 @@ class AlertEngine:
             for a in medium:
                 lines.append(f"  {a.symbol}: {a.control_score}分 | {a.phase}")
             lines.append("")
+
+        if pump_monitor is not None:
+            try:
+                stats = pump_monitor.get_full_stats(days=30)
+                lines.append("── 📈 30日精度统计 ──")
+                lines.append(f"  预警总数: {stats.get('total_alerts', 0)}")
+                lines.append(f"  精确率 (Precision): {stats.get('precision', 0):.1f}%")
+                lines.append(f"  召回率 (Recall): {stats.get('recall', 0):.1f}%")
+                lines.append(f"  命中: {stats.get('predicted', 0)} | 漏报: {stats.get('missed', 0)} | 误报: {stats.get('false_positives', 0)}")
+                lines.append("")
+            except Exception as e:
+                logger.warning(f"[DailySummary] 统计获取失败: {e}")
+
         lines.append("⚠️ 本报告不构成投资建议")
         return "\n".join(lines)
 

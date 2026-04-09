@@ -18,6 +18,7 @@ from datetime import datetime
 
 from config import WATCH_TOKENS, SCAN_INTERVAL_MINUTES, KLINE_INTERVAL
 from data.binance_client import BinanceClient
+from data.realtime_engine import RealtimeEngine
 from data.onchain_client import OnchainClient
 from data.data_store import DataStore
 from data.token_manager import TokenManager
@@ -31,6 +32,7 @@ from analysis.learning_engine import LearningEngine
 from alerts.telegram_bot import TelegramBot
 from alerts.webhook import WebhookNotifier
 from alerts.logger import setup_logging
+from trading.paper_trader import PaperTrader
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,8 @@ class WhaleAlertService:
         self.ml = PredictionManager(self.store, model_type="gbdt")
         self.telegram = TelegramBot()
         self.webhook = WebhookNotifier()
+        self.realtime = RealtimeEngine()
+        self.trader = PaperTrader(self.store)
 
         self._running = True
         self._scan_count = 0
@@ -122,16 +126,20 @@ class WhaleAlertService:
                     ts = int(time.time() * 1000)
 
                     # 控盘 + 出货: 同一份数据, 零额外开销
+                    funding = snap.get("funding_rate")
+
                     whale = self.detector.analyze(
                         symbol=sym, indicators=ind, onchain=oc,
                         orderbook_spread=ob.spread_pct if ob else 0,
                         orderbook_ratio=ob_r,
                         trade_stats_large_pct=tr.large_trade_pct if tr else 0,
-                        trade_stats_buy_ratio=tr_b, timestamp=ts)
+                        trade_stats_buy_ratio=tr_b, timestamp=ts,
+                        funding_rate=funding)
 
                     crash = self.crash_detector.analyze(
                         symbol=sym, indicators=ind, onchain=oc,
-                        orderbook_ratio=ob_r, trade_buy_ratio=tr_b, timestamp=ts)
+                        orderbook_ratio=ob_r, trade_buy_ratio=tr_b, timestamp=ts,
+                        funding_rate=funding)
 
                     # ML校正
                     ml = self.ml.predict(ind, whale, oc)
@@ -208,6 +216,30 @@ class WhaleAlertService:
         if crash_alerts:
             logger.warning(f"📉 {len(crash_alerts)} 暴跌预警")
 
+        # ── Paper Trading: Open positions on alerts ──
+        for a in pump_alerts:
+            if hasattr(a, 'trade_signal') and a.trade_signal:
+                self.trader.open_position(
+                    symbol=a.symbol, direction="long",
+                    price=a.analysis.price,
+                    alert_data={
+                        "score": a.analysis.control_score,
+                        "phase": a.analysis.phase,
+                        "probability": a.analysis.pump_probability,
+                        "signals": [s.to_dict() for s in a.analysis.signals],
+                    },
+                    sl_pct=a.trade_signal.get("stop_loss_pct"),
+                    tp_pct=a.trade_signal.get("take_profit_pct"))
+        for cd in crash_alerts:
+            if hasattr(cd, 'trade_signal') and cd.trade_signal:
+                price = current_prices.get(cd.symbol, {}).get("price", 0)
+                if price > 0:
+                    self.trader.open_position(
+                        symbol=cd.symbol, direction="short", price=price,
+                        alert_data={"score": 0, "phase": ""},
+                        sl_pct=cd.trade_signal.get("stop_loss_pct"),
+                        tp_pct=cd.trade_signal.get("take_profit_pct"))
+
         # ══════════════════════════════════════════════════════════════
         # STEP 3: 事件检测 — 暴涨/暴跌/误报 并行
         # ══════════════════════════════════════════════════════════════
@@ -236,6 +268,16 @@ class WhaleAlertService:
             return fps
 
         pumps, crashes, fps = await asyncio.gather(_det_pump(), _det_crash(), _det_fp())
+
+        # Adaptive threshold feedback
+        for e in pumps:
+            if e.was_predicted:
+                self.alert_engine.adaptive.record_hit(e.symbol)
+        for fp in fps:
+            self.alert_engine.adaptive.record_false_positive(fp["symbol"])
+
+        # ── Paper Trading: Check open positions ──
+        closed_trades = self.trader.check_positions(current_prices)
 
         # ══════════════════════════════════════════════════════════════
         # STEP 4: ML样本 + 学习 + 重训练
@@ -279,15 +321,92 @@ class WhaleAlertService:
         now = datetime.now()
         if now.hour == 8 and now.minute < SCAN_INTERVAL_MINUTES + 1:
             await self.telegram.send_message(
-                self.alert_engine.generate_daily_summary(all_whales))
+                self.alert_engine.generate_daily_summary(all_whales, self.pump_monitor))
             await self.telegram.send_message(
                 self.learning_engine.get_status_report(30))
+            trade_stats = self.trader.get_stats(30)
+            await self.telegram.send_message(
+                self.trader.format_stats_message(trade_stats))
 
         elapsed = time.time() - start
         logger.info(
             f"[Scan #{self._scan_count}] {elapsed:.1f}s (采集{t1:.1f}s) | "
             f"分析{len(all_whales)} 涨警{len(pump_alerts)} 跌警{len(crash_alerts)} "
             f"爆涨{len(pumps)} 暴跌{len(crashes)} 误报{len(fps)}")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 快速信号 (实时引擎)
+    # ══════════════════════════════════════════════════════════════════
+
+    async def check_fast_signals(self):
+        """检查实时引擎产生的快速信号, 对命中代币执行快速分析并推送预警"""
+        signals = self.realtime.get_pending_fast_signals()
+        if not signals:
+            return
+
+        # 按代币去重 (同代币多个信号只分析一次)
+        seen_symbols = set()
+        for sig in signals:
+            symbol = sig.get("symbol", "")
+            if not symbol or symbol in seen_symbols:
+                continue
+            seen_symbols.add(symbol)
+
+            logger.info(f"[FastSignal] {symbol} type={sig.get('type')} — 触发快速分析")
+
+            # 找到对应 TokenConfig
+            tcfg = next((t for t in WATCH_TOKENS if t.symbol == symbol), None)
+            if tcfg is None:
+                continue
+
+            try:
+                # 复用 analyze_token 逻辑: 采集快照 + 双向分析
+                from analysis.indicators import calc_indicators
+                snap = await self.binance.collect_full_snapshot(symbol)
+                klines = snap.get("klines", [])
+                if not klines or len(klines) < 30:
+                    continue
+
+                ind = calc_indicators(klines, symbol)
+                ob = snap.get("orderbook")
+                tr = snap.get("trades")
+                ob_r = ob.bid_ask_ratio if ob else 0.5
+                tr_b = tr.buy_ratio if tr else 0.5
+                ts = int(time.time() * 1000)
+
+                whale = self.detector.analyze(
+                    symbol=symbol, indicators=ind, onchain=None,
+                    orderbook_spread=ob.spread_pct if ob else 0,
+                    orderbook_ratio=ob_r,
+                    trade_stats_large_pct=tr.large_trade_pct if tr else 0,
+                    trade_stats_buy_ratio=tr_b, timestamp=ts)
+
+                crash = self.crash_detector.analyze(
+                    symbol=symbol, indicators=ind, onchain=None,
+                    orderbook_ratio=ob_r, trade_buy_ratio=tr_b, timestamp=ts)
+
+                # 附加实时指标到信号消息
+                rt = self.realtime.get_realtime_metrics(symbol)
+                signal_info = (
+                    f"[实时信号] {symbol} | {sig.get('type')}\n"
+                    f"  量涌1m={rt['volume_surge_1m']:.1f}x 5m={rt['volume_surge_5m']:.1f}x\n"
+                    f"  价格5m={rt['price_change_5m']:+.2f}% 15m={rt['price_change_15m']:+.2f}%\n"
+                    f"  大单5m={rt['large_trade_count_5m']} 买卖比={rt['bid_ask_imbalance']:.2f}"
+                )
+
+                # 评估预警
+                pump_alerts = self.alert_engine.evaluate_batch([whale])
+                for a in pump_alerts:
+                    await self.telegram.send_alert(a.message + f"\n{signal_info}")
+                    await self.webhook.send(a.message)
+
+                crash_alerts = self.alert_engine.evaluate_crash_batch([crash] if crash.crash_score > 0 else [])
+                for cd in crash_alerts:
+                    await self.telegram.send_message(cd.message + f"\n{signal_info}")
+                    await self.webhook.send(cd.message)
+
+            except Exception as e:
+                logger.error(f"[FastSignal] {symbol} 分析失败: {e}", exc_info=True)
 
     # ══════════════════════════════════════════════════════════════════
     # 消息
@@ -322,17 +441,36 @@ class WhaleAlertService:
             f"🐋 Whale Alert v4 启动\n"
             f"  📡 {self.token_manager.get_token_count()}代币 ⏱{SCAN_INTERVAL_MINUTES}min\n"
             f"  🚀 涨≥30%/24h 📉 跌≥50%/4h 🔄 并行执行")
+
+        # 启动实时引擎
+        symbols = [t.symbol for t in WATCH_TOKENS]
+        await self.realtime.start(symbols=symbols)
+
         await self.run_scan()
+
+        scan_interval_secs = SCAN_INTERVAL_MINUTES * 60
+        fast_signal_interval_secs = 60
+        elapsed_since_scan = 0
+
         while self._running:
             try:
-                await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+                await asyncio.sleep(fast_signal_interval_secs)
+                elapsed_since_scan += fast_signal_interval_secs
+
                 if self._running:
+                    await self.check_fast_signals()
+
+                if elapsed_since_scan >= scan_interval_secs and self._running:
+                    elapsed_since_scan = 0
                     await self.run_scan()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[Loop] {e}", exc_info=True)
                 await asyncio.sleep(60)
+                elapsed_since_scan += 60
+
+        await self.realtime.stop()
         await self.binance.close()
         await self.onchain.close()
 
