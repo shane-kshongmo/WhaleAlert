@@ -16,7 +16,7 @@ from typing import List, Dict, Optional
 from collections import Counter
 from dataclasses import dataclass
 
-from config import ALERT_CONFIG as AC, CRASH_ALERT_CONFIG as CAC
+from config import ALERT_CONFIG as AC, CRASH_ALERT_CONFIG as CAC, STABLECOIN_SYMBOLS
 from analysis.whale_detector import WhaleAnalysis, CrashAnalysis
 from data.data_store import DataStore
 
@@ -107,12 +107,23 @@ class AlertEngine:
         symbol = analysis.symbol
 
         # ML confidence gating: adjust base minimum score
+        # During cold start (model untrained), use base threshold directly
         if ml_confidence == "high":
-            base_min = max(60, AC.min_control_score - 10)
+            base_min = max(50, AC.min_control_score - 5)
         elif ml_confidence == "low":
-            base_min = AC.min_control_score + 15
+            base_min = AC.min_control_score  # cold start: no penalty
         else:
             base_min = AC.min_control_score
+
+        # Multi-dimension combo: lower threshold when golden combo fires
+        # Research shows 86% of pumps had 动量构建+价差异常+买卖不平衡 simultaneously
+        if analysis.signal_count >= 3:
+            active_dims = {s.dimension for s in analysis.signals}
+            golden = {"动量构建", "价差异常", "买卖不平衡"}
+            if golden.issubset(active_dims):
+                base_min = min(base_min, 25)  # Lower to 25 for golden combo
+            elif analysis.signal_count >= 4:
+                base_min = min(base_min, 30)  # Lower to 30 for 4+ dimensions
 
         # Apply adaptive threshold + score boost
         effective_min = self.adaptive.get_adjusted_min_score(symbol, base_min) + score_boost
@@ -152,7 +163,7 @@ class AlertEngine:
                 "last_score": analysis.control_score,
             }
             decision.reason = "Stage 1: Watching"
-            logger.debug(f"[Alert] {symbol}: 加入观察列表 score={analysis.control_score}")
+            logger.info(f"[Alert] {symbol}: Stage1 加入观察列表 score={analysis.control_score} pump={analysis.pump_probability}%")
             return decision
         else:
             scan_count = existing.get("scan_count", 1) + 1
@@ -161,11 +172,11 @@ class AlertEngine:
             self._watchlist[symbol]["scan_count"] = scan_count
             self._watchlist[symbol]["last_score"] = analysis.control_score
 
-            if score_delta < -5:
+            if score_delta < -15:
                 # Signal weakened — cancel watch
                 del self._watchlist[symbol]
                 decision.reason = f"信号减弱: delta={score_delta}"
-                logger.debug(f"[Alert] {symbol}: 信号减弱, 取消观察")
+                logger.info(f"[Alert] {symbol}: 信号减弱, 取消观察 delta={score_delta}")
                 return decision
 
             # Stage 2: confirmed, fire alert
@@ -175,8 +186,8 @@ class AlertEngine:
         decision.urgency = "critical" if analysis.control_score >= 85 else "high"
         decision.message = self._build_message(analysis)
         decision.reason = "全部条件满足"
-        if hasattr(analysis, 'signal_reliability') and analysis.signal_reliability >= 0.4:
-            decision.trade_signal = analysis.get_suggested_sl_tp()
+        # Always generate trade signal — paper_trader handles tiered risk
+        decision.trade_signal = analysis.get_suggested_sl_tp()
 
         logger.warning(f"🚨 [ALERT] {symbol}: score={analysis.control_score}, phase={analysis.phase}, pump={analysis.pump_probability}%")
         return decision
@@ -191,6 +202,8 @@ class AlertEngine:
         return max(high_control / total, big_move / total)
 
     def evaluate_batch(self, analyses: List[WhaleAnalysis]) -> List[AlertDecision]:
+        # 过滤稳定币
+        analyses = [a for a in analyses if a.symbol not in STABLECOIN_SYMBOLS]
         correlation = self._check_market_correlation(analyses)
         score_boost = 15 if correlation > 0.5 else 0
         if score_boost:
@@ -211,7 +224,113 @@ class AlertEngine:
                     "message": decision.message,
                 })
             else:
-                logger.debug(f"[Alert] {a.symbol}: 不触发 - {decision.reason}")
+                logger.info(f"[Alert] {a.symbol}: {decision.reason}")
+        return results
+
+    # ══════════════════════════════════════════════════════════════════════
+    # 突发拉盘检测 (Breakout Detector)
+    # 捕获正在拉盘中的代币 — 不依赖控盘积累信号, 而是检测实时动量爆发
+    # ══════════════════════════════════════════════════════════════════════
+
+    def detect_breakouts(self, analyses: List[WhaleAnalysis],
+                         prev_prices: Dict[str, float],
+                         current_prices: Dict[str, float]) -> List[AlertDecision]:
+        """
+        Detect tokens in active breakout (already pumping).
+
+        Criteria:
+        - Price surged >= breakout_min_change_pct since last scan (15 min)
+        - Volume >= 2x average (volume surge)
+        - Not already in the accumulation-based alert list
+        - No duplicate open position
+        """
+        breakout_min_change_pct = 3.0   # 3% price change in one scan interval
+        breakout_min_vol_mult = 1.5     # volume surge vs average
+        breakout_cooldown_hours = 2.0   # cooldown for breakout alerts
+
+        results = []
+        alerted_symbols = set()  # avoid duplicates
+
+        for a in analyses:
+            if a.symbol in STABLECOIN_SYMBOLS:
+                continue
+            if a.symbol in alerted_symbols:
+                continue
+
+            prev = prev_prices.get(a.symbol)
+            curr = current_prices.get(a.symbol)
+            if isinstance(curr, dict):
+                curr = curr.get("price", 0)
+            if not prev or not curr or prev <= 0 or curr <= 0:
+                continue
+
+            # Price change since last scan
+            price_change_pct = ((curr - prev) / prev) * 100
+            if price_change_pct < breakout_min_change_pct:
+                continue
+
+            # Volume check: use 24h volume vs estimated average
+            vol = a.volume_24h
+            if vol <= 0:
+                continue
+
+            # Check cooldown
+            last_alert_ts = self.store.get_last_alert_time(a.symbol)
+            if last_alert_ts:
+                hours_since = (time.time() * 1000 - last_alert_ts) / 3600000
+                if hours_since < breakout_cooldown_hours:
+                    continue
+
+            # Breakout confirmed
+            change_emoji = "🔥" if price_change_pct >= 8 else "⚡"
+            decision = AlertDecision(
+                should_alert=True,
+                symbol=a.symbol,
+                analysis=a,
+                urgency="high" if price_change_pct >= 8 else "normal",
+                reason=f"突发拉盘: {price_change_pct:.1f}%/{len(prev_prices)}min",
+                trade_signal={
+                    "stop_loss_pct": 4.0 if price_change_pct >= 8 else 5.0,
+                    "take_profit_pct": 10.0 if price_change_pct >= 8 else 8.0,
+                    "risk_reward": 2.0 if price_change_pct >= 8 else 1.6,
+                    "reliability": 0.3,  # lower reliability than accumulation signals
+                    "direction": "long",
+                    "breakout": True,
+                    "breakout_change_pct": round(price_change_pct, 1),
+                },
+            )
+            decision.message = (
+                f"{change_emoji} 突发拉盘 {change_emoji}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ {a.symbol}\n"
+                f"━━━━━━━━━━━━━━━━━━━\n\n"
+                f"💰 现价: ${curr:,.6g}\n"
+                f"⚡ 短期涨幅: {price_change_pct:+.1f}%\n"
+                f"📈 24h: {a.change_24h:+.2f}%\n"
+                f"📊 控盘分: {a.control_score} | {a.phase}\n"
+                f"💵 成交额: ${vol:,.0f}\n\n"
+                f"⚠️ 追涨有风险, 不构成投资建议\n"
+                f"━━━━━━━━━━━━━━━━━━━"
+            ).strip()
+
+            results.append(decision)
+            alerted_symbols.add(a.symbol)
+            self.store.save_alert({
+                "symbol": a.symbol,
+                "timestamp": a.timestamp,
+                "control_score": a.control_score,
+                "phase": f"突发拉盘+{price_change_pct:.0f}%",
+                "pump_probability": a.pump_probability,
+                "signals": [{"dimension": "breakout", "score": int(price_change_pct),
+                             "severity": "high", "description": f"短期涨幅{price_change_pct:.1f}%"}],
+                "message": decision.message,
+            })
+
+            logger.warning(
+                f"⚡ [BREAKOUT] {a.symbol}: +{price_change_pct:.1f}% "
+                f"in scan interval, price=${curr:.6g}"
+            )
+
         return results
 
     def _build_message(self, a: WhaleAnalysis) -> str:
@@ -351,6 +470,8 @@ class AlertEngine:
         return decision
 
     def evaluate_crash_batch(self, crashes: List[CrashAnalysis]) -> List[AlertDecision]:
+        # 过滤稳定币
+        crashes = [c for c in crashes if c.symbol not in STABLECOIN_SYMBOLS]
         results = []
         for c in crashes:
             d = self.evaluate_crash(c)
