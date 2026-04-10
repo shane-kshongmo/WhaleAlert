@@ -673,7 +673,7 @@ class PaperTrader:
         import time as _time
         with self.store._conn() as conn:
             result = self._close_trade(trade_id, current_price, int(_time.time() * 1000), reason, conn)
-        return dict(result) if result else None
+        return asdict(result) if result else None
 
     def _row_to_trade(self, row) -> TradeData:
         """Convert database row to TradeData, filtering extra columns"""
