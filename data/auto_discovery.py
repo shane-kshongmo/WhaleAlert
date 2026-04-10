@@ -45,9 +45,14 @@ class DiscoveryConfig:
     min_quote_volume_24h: float = 500_000     # 最低 24h 成交额 (USDT)
     max_quote_volume_24h: float = 5_000_000_000  # 排除 BTC/ETH 等巨鲸 (50亿)
     excluded_bases: Set[str] = field(default_factory=lambda: {
-        "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "USDP",  # 稳定币
-        "BTCB", "WBTC", "WETH", "STETH", "CBETH",                 # wrapped
-        "BTTC",                                                     # 极低价垃圾
+        # 稳定币 (法币锚定 + 加密锚定)
+        "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "USDP",
+        "USDE", "RLUSD", "BFUSD", "XUSD", "EUR", "EURI", "PAXG", "XAUT",
+        "PYUSD", "FRAX", "LUSD", "BUSD", "USTC", "USDM", "USDJ",
+        # wrapped / 衍生
+        "BTCB", "WBTC", "WETH", "STETH", "CBETH", "WEETH", "RSETH",
+        # 极低价垃圾
+        "BTTC",
     })
     excluded_symbols: Set[str] = field(default_factory=lambda: {
         "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",   # 大盘, 不可能被控盘
@@ -66,10 +71,10 @@ class DiscoveryConfig:
     pump_alert_change_pct: float = 30        # 24h 涨超 30% 直接关注 (可能正向50%冲)
 
     # Level 3: 候选池大小
-    max_watchlist_size: int = 120            # 最多同时监控数量
+    max_watchlist_size: int = 60            # 最多同时监控数量
     min_watchlist_size: int = 30             # 最少保留数量
     # 按成交额排名取 top N 作为保底
-    top_volume_always_watch: int = 50        # 成交额 Top50 始终监控
+    top_volume_always_watch: int = 30        # 成交额 Top30 始终监控 (避免API限流)
 
     # 扫描频率
     scan_interval_hours: float = 4.0         # 每 4 小时扫描一次
@@ -251,7 +256,8 @@ class AutoDiscoveryScanner:
         valid = {s: t for s, t in tickers.items()
                  if t.quote_volume >= cfg.min_quote_volume_24h
                  and t.quote_volume <= cfg.max_quote_volume_24h
-                 and s in set(self._all_usdt_pairs)}
+                 and s in set(self._all_usdt_pairs)
+                 and abs(t.change_pct) > 0.3}  # 排除稳定币 (24h涨跌<0.3%)
 
         # 规则 1: 成交额 Top N 始终监控
         by_vol = sorted(valid.values(), key=lambda x: -x.quote_volume)

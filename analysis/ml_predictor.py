@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 # 特征工程
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 完整特征列表 (38维)
+# 完整特征列表 (41维)
 FEATURE_NAMES = [
-    # ── 规则引擎输出 (7维得分) ──
+    # ── 规则引擎输出 (8维得分) ──
     "dim_accumulation",     # 缩量横盘得分
     "dim_large_orders",     # 大单占比得分
     "dim_imbalance",        # 买卖不平衡得分
@@ -46,6 +46,7 @@ FEATURE_NAMES = [
     "dim_wash_trade",       # 对倒交易得分
     "dim_concentration",    # 筹码集中得分
     "dim_spread",           # 价差异常得分
+    "dim_momentum",         # 动量构建得分
     "control_score",        # 规则引擎总分
     "rule_pump_prob",       # 规则引擎概率
 
@@ -89,9 +90,14 @@ FEATURE_NAMES = [
     # ── 市场背景 ──
     "btc_change_24h",       # BTC 24h change
     "btc_rsi",              # BTC RSI
+
+    # ── 实时特征 (从 realtime_engine) ──
+    "rt_volume_surge_5m",   # 5分钟成交量突增
+    "rt_price_change_5m",   # 5分钟价格变化
+    "rt_bid_ask_imbalance", # 买卖盘不平衡 (实时)
 ]
 
-NUM_FEATURES = 38
+NUM_FEATURES = 41
 
 
 def extract_features(
@@ -101,11 +107,12 @@ def extract_features(
     historical_scores: List[int] = None,
     btc_data: dict = None,
     pump_history: dict = None,
+    realtime_metrics: dict = None,  # realtime_engine metrics
 ) -> np.ndarray:
     """
     从各模块的输出中提取统一特征向量
 
-    返回: shape=(38,) 的 numpy array
+    返回: shape=(41,) 的 numpy array
     """
     ind = indicators
     wa = whale_analysis
@@ -153,6 +160,11 @@ def extract_features(
     btc_change_24h = btc_data.get("change_24h", 0.0) if btc_data else 0.0
     btc_rsi = btc_data.get("rsi", 50.0) if btc_data else 50.0
 
+    # ── 新增: 实时特征 ──
+    rt_volume_surge_5m = realtime_metrics.get("volume_surge_5m", 0.0) if realtime_metrics else 0.0
+    rt_price_change_5m = realtime_metrics.get("price_change_5m", 0.0) if realtime_metrics else 0.0
+    rt_bid_ask_imbalance = realtime_metrics.get("bid_ask_imbalance", 0.5) if realtime_metrics else 0.5
+
     features = np.array([
         # 规则引擎输出
         float(wa.dim_accumulation),
@@ -162,6 +174,7 @@ def extract_features(
         float(wa.dim_wash_trade),
         float(wa.dim_concentration),
         float(wa.dim_spread),
+        float(wa.dim_momentum),
         float(wa.control_score),
         float(wa.pump_probability),
 
@@ -205,6 +218,11 @@ def extract_features(
         # 市场背景
         float(btc_change_24h),
         float(btc_rsi),
+
+        # 实时特征
+        float(rt_volume_surge_5m),
+        float(rt_price_change_5m),
+        float(rt_bid_ask_imbalance),
     ], dtype=np.float32)
 
     # 处理 NaN/Inf
@@ -414,12 +432,13 @@ class GBDTPredictor(BasePredictor):
             logger.error(f"[GBDT] predict_batch error: {e}")
             return np.full(features.shape[0], -1.0)
 
-    def _train_single(self, X, y, weights):
+    def _train_single(self, X, y, weights, class_weight=None):
         import lightgbm as lgb
         model = lgb.LGBMClassifier(
             n_estimators=100, max_depth=5, learning_rate=0.05,
             num_leaves=31, min_child_samples=5, subsample=0.8,
             colsample_bytree=0.8, reg_alpha=0.1, reg_lambda=0.1,
+            class_weight=class_weight,
             verbose=-1)
         model.fit(X, y, sample_weight=weights)
         return model
@@ -431,6 +450,9 @@ class GBDTPredictor(BasePredictor):
         # Prepare data
         X = np.array([s["features"] if isinstance(s, dict) else s.features for s in samples])
         y = np.array([s["label"] if isinstance(s, dict) else s.label for s in samples])
+
+        # Count positive samples
+        n_positive = int(y.sum())
 
         # Handle feature dimension mismatch (old 30-feature samples vs new 38)
         if X.shape[1] < NUM_FEATURES:
@@ -449,6 +471,62 @@ class GBDTPredictor(BasePredictor):
             lbl = s.get("label") if isinstance(s, dict) else s.label
             if lbl == 1:
                 weights[i] *= 3.0
+
+        # Cold start: Use single model with balanced class weights when positive samples < 20
+        if n_positive < 20:
+            logger.info(f"[GBDT] Cold start mode: using single balanced model (n_positive={n_positive})")
+            self._model = self._train_single(X, y, weights, class_weight='balanced')
+            self._model_version += 1
+
+            # Skip ensemble models in cold start mode
+            self._model_recent = None
+            self._model_highconf = None
+
+            # Fit calibrator (Platt scaling)
+            self._fit_calibrator(X, y)
+
+            # Simple metrics
+            try:
+                from sklearn.metrics import roc_auc_score, precision_score, recall_score
+                y_pred = self._model.predict_proba(X)[:, 1]
+                auc = roc_auc_score(y, y_pred) if len(set(y)) > 1 else 0.5
+                y_bin = (y_pred >= 0.5).astype(int)
+                prec = precision_score(y, y_bin, zero_division=0)
+                rec = recall_score(y, y_bin, zero_division=0)
+            except Exception:
+                auc, prec, rec = 0.5, 0.0, 0.0
+
+            # Feature importance
+            importance = self._model.feature_importances_
+            top_idx = np.argsort(importance)[-10:][::-1]
+            top_features = [
+                (FEATURE_NAMES[i] if i < len(FEATURE_NAMES) else f"f{i}", float(importance[i]))
+                for i in top_idx
+            ]
+
+            self._is_trained = True
+            self._last_train_time = int(time.time())
+
+            metrics = {
+                "trained": True,
+                "auc": auc,
+                "precision": prec,
+                "recall": rec,
+                "cv_auc_mean": auc,
+                "cv_auc_std": 0.0,
+                "top_features": top_features,
+                "samples": len(samples),
+                "n_positive": n_positive,
+                "cold_start": True,
+            }
+            self._train_metrics = metrics
+
+            logger.warning(
+                f"[GBDT] Cold start training complete v{self._model_version}: "
+                f"AUC={auc:.3f} P={prec:.1%} R={rec:.1%} "
+                f"({len(samples)} samples, {n_positive} positive)"
+            )
+            return metrics
 
         # Train primary model (all data)
         self._model = self._train_single(X, y, weights)

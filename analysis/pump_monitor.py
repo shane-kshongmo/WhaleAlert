@@ -61,9 +61,9 @@ class PumpEvent:
 
 @dataclass
 class PumpDefinition:
-    """暴涨定义: 24h ≥30%"""
-    min_pump_pct_24h: float = 30.0
-    min_volume_surge: float = 1.5        # 量≥1.5x (30%不需要极端放量)
+    """暴涨定义: 24h ≥20% (临时降低以加快ML训练样本收集)"""
+    min_pump_pct_24h: float = 20.0
+    min_volume_surge: float = 1.5        # 量≥1.5x (20%不需要极端放量)
     max_btc_change_24h: float = 12.0     # BTC涨>12% → 大盘行情
 
 @dataclass

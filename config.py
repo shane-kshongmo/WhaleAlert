@@ -24,6 +24,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 稳定币过滤 (不参与控盘分析)
+# ═══════════════════════════════════════════════════════════════════════════
+
+STABLECOIN_SYMBOLS = {
+    "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT",
+    "USDDUSDT", "USDPUSDT", "USDEUSDT", "RLUSDUSDT", "BFUSDUSDT",
+    "XUSDUSDT", "EURUSDT", "EURIUSDT", "PAXGUSDT", "XAUTUSDT",
+    "PYUSDUSDT", "FRAXUSDT", "LUSDUSDT", "USTCUSDT", "USDMUSDT",
+    "USDJUSDT", "SUSDUSDT", "DAIUSDT",
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 监控代币列表
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -81,9 +93,9 @@ class DetectionThresholds:
 
     # ── 缩量横盘 (吸筹特征) ──
     vol_shrink_critical: float = 0.35
-    vol_shrink_high: float = 0.55
-    price_range_narrow: float = 0.10
-    price_range_medium: float = 0.18
+    vol_shrink_high: float = 1.5
+    price_range_narrow: float = 0.05
+    price_range_medium: float = 0.10
 
     # ── 大单占比 ──
     large_order_critical: float = 40.0
@@ -138,17 +150,20 @@ THRESHOLDS = DetectionThresholds()
 @dataclass
 class AlertConfig:
     """暴涨预警条件"""
-    min_control_score: int = 70
+    min_control_score: int = 40
     min_signal_count: int = 3
     required_phases: List[str] = field(
         default_factory=lambda: [
             "吸筹末期",
             "即将拉盘",
             "高度控盘",
+            "疑似吸筹",
+            "中度控盘",
+            "轻度异常",
         ]
     )
     cooldown_hours: float = 4.0
-    min_pump_probability: int = 55
+    min_pump_probability: int = 25
 
 @dataclass
 class CrashAlertConfig:

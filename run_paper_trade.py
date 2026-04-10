@@ -30,7 +30,7 @@ def main():
 
     if not args.no_web:
         from web.dashboard import start_dashboard, set_managers
-        set_managers(service.token_manager, service.pump_monitor, service.scanner)
+        set_managers(service.token_manager, service.pump_monitor, service.scanner, service.trader)
         threading.Thread(target=start_dashboard, daemon=True).start()
         logger.info("📊 Dashboard: http://localhost:8888")
 

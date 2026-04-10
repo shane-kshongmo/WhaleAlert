@@ -59,6 +59,7 @@ class WhaleAlertService:
         self._running = True
         self._scan_count = 0
         self._feature_cache: Dict = {}
+        self._prev_prices: Dict[str, float] = {}  # for breakout detection
 
         self.learning_engine.restore_learned_thresholds()
         logger.info(f"[Init] 代币:{self.token_manager.get_token_count()} ML:{self.ml.predictor.is_ready()}")
@@ -97,7 +98,7 @@ class WhaleAlertService:
         # STEP 1: 并发采集 + 双向分析
         #   每个代币: 1次API → WhaleAnalysis + CrashAnalysis
         # ══════════════════════════════════════════════════════════════
-        sem = asyncio.Semaphore(10)
+        sem = asyncio.Semaphore(5)
 
         async def analyze_token(tcfg) -> Tuple[Optional[WhaleAnalysis], Optional[CrashAnalysis]]:
             async with sem:
@@ -144,7 +145,11 @@ class WhaleAlertService:
                     # ML校正
                     ml = self.ml.predict(ind, whale, oc)
                     if ml["source"] != "rule":
-                        whale.pump_probability = ml["final_prob"]
+                        # Blend: use max of rule-based and ML probability
+                        # Avoids ML model returning 0 and overriding valid rule-based estimate
+                        rule_prob = whale.pump_probability
+                        ml_prob = ml["final_prob"]
+                        whale.pump_probability = max(rule_prob, ml_prob)
                     self._feature_cache[sym] = ml["features"]
 
                     # 存储
@@ -216,6 +221,39 @@ class WhaleAlertService:
         if crash_alerts:
             logger.warning(f"📉 {len(crash_alerts)} 暴跌预警")
 
+        # ── STEP 2.5: Breakout Detection (突发拉盘) ──
+        breakout_alerts = []
+        if self._prev_prices:
+            breakout_alerts = self.alert_engine.detect_breakouts(
+                all_whales, self._prev_prices, current_prices)
+            for ba in breakout_alerts:
+                await self.telegram.send_alert(ba.message)
+                await self.webhook.send(ba.message)
+                # Open breakout position with tight stops
+                cur = current_prices.get(ba.symbol, {})
+                price = cur.get("price", 0) if isinstance(cur, dict) else cur
+                if price > 0 and ba.trade_signal:
+                    self.trader.open_position(
+                        symbol=ba.symbol, direction="long", price=price,
+                        alert_data={
+                            "score": ba.analysis.control_score,
+                            "phase": f"突发拉盘",
+                            "probability": 0,
+                            "signals": [],
+                        },
+                        sl_pct=ba.trade_signal.get("stop_loss_pct"),
+                        tp_pct=ba.trade_signal.get("take_profit_pct"),
+                        volume_24h=ba.analysis.volume_24h)
+        if breakout_alerts:
+            logger.warning(f"⚡ {len(breakout_alerts)} 突发拉盘")
+
+        # Save prices for next scan's breakout detection
+        self._prev_prices = {}
+        for sym, val in current_prices.items():
+            p = val.get("price", 0) if isinstance(val, dict) else val
+            if p > 0:
+                self._prev_prices[sym] = p
+
         # ── Paper Trading: Open positions on alerts ──
         for a in pump_alerts:
             if hasattr(a, 'trade_signal') and a.trade_signal:
@@ -229,16 +267,19 @@ class WhaleAlertService:
                         "signals": [s.to_dict() for s in a.analysis.signals],
                     },
                     sl_pct=a.trade_signal.get("stop_loss_pct"),
-                    tp_pct=a.trade_signal.get("take_profit_pct"))
+                    tp_pct=a.trade_signal.get("take_profit_pct"),
+                    volume_24h=a.analysis.volume_24h)
         for cd in crash_alerts:
             if hasattr(cd, 'trade_signal') and cd.trade_signal:
                 price = current_prices.get(cd.symbol, {}).get("price", 0)
+                vol = current_prices.get(cd.symbol, {}).get("volume_current", 0)
                 if price > 0:
                     self.trader.open_position(
                         symbol=cd.symbol, direction="short", price=price,
                         alert_data={"score": 0, "phase": ""},
                         sl_pct=cd.trade_signal.get("stop_loss_pct"),
-                        tp_pct=cd.trade_signal.get("take_profit_pct"))
+                        tp_pct=cd.trade_signal.get("take_profit_pct"),
+                        volume_24h=vol)
 
         # ══════════════════════════════════════════════════════════════
         # STEP 3: 事件检测 — 暴涨/暴跌/误报 并行
@@ -276,8 +317,9 @@ class WhaleAlertService:
         for fp in fps:
             self.alert_engine.adaptive.record_false_positive(fp["symbol"])
 
-        # ── Paper Trading: Check open positions ──
-        closed_trades = self.trader.check_positions(current_prices)
+        # ── Paper Trading: Check open positions (with score deterioration) ──
+        latest_scores = {w.symbol: w.control_score for w in all_whales}
+        closed_trades = self.trader.check_positions(current_prices, latest_scores)
 
         # ══════════════════════════════════════════════════════════════
         # STEP 4: ML样本 + 学习 + 重训练
@@ -485,7 +527,7 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: service.stop())
 
     from web.dashboard import start_dashboard, set_managers
-    set_managers(service.token_manager, service.pump_monitor, service.scanner)
+    set_managers(service.token_manager, service.pump_monitor, service.scanner, service.trader)
     threading.Thread(target=start_dashboard, daemon=True).start()
     logger.info(f"📊 Dashboard: http://localhost:8888")
 
