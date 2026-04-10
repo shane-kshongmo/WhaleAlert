@@ -210,6 +210,7 @@ class PaperTrader:
         sl_pct: Optional[float] = None,
         tp_pct: Optional[float] = None,
         volume_24h: float = 0,
+        current_prices: Optional[Dict[str, float]] = None,
     ) -> Optional[TradeData]:
         """Open a new trading position with dynamic sizing and tier-based SL/TP"""
         if direction not in ("long", "short"):
@@ -258,7 +259,7 @@ class PaperTrader:
             if len(open_trades) >= self.config.max_open_positions:
                 # Eviction: check if new signal is strong enough to replace weakest
                 if self.config.eviction_enabled:
-                    evicted = self._try_evict(open_trades, alert_score, conn)
+                    evicted = self._try_evict(open_trades, alert_score, conn, current_prices)
                     if not evicted:
                         logger.info(f"[PaperTrader] Max positions ({self.config.max_open_positions}) reached, no eviction candidate")
                         return None
@@ -317,7 +318,8 @@ class PaperTrader:
 
         return self._get_trade_by_id(trade_id)
 
-    def _try_evict(self, open_trades, new_score: int, conn) -> bool:
+    def _try_evict(self, open_trades, new_score: int, conn,
+                    current_prices: Optional[Dict[str, float]] = None) -> bool:
         """Try to evict the weakest position for a stronger signal"""
         # Find weakest: lowest score, break ties by worst PnL
         weakest = None
@@ -330,10 +332,16 @@ class PaperTrader:
         if weakest is None:
             return False
 
-        # Close the weakest position at "eviction"
+        # Close the weakest position at actual market price (not entry price)
         now_ms = int(datetime.now().timestamp() * 1000)
-        # We don't have current price here, use entry price (will be updated on next check)
-        closed = self._close_trade(weakest["id"], 0, now_ms, "evicted", conn)
+        evict_price = 0
+        if current_prices:
+            cp = current_prices.get(weakest["symbol"], 0)
+            if isinstance(cp, dict):
+                cp = cp.get("price", 0)
+            if cp > 0:
+                evict_price = cp
+        closed = self._close_trade(weakest["id"], evict_price, now_ms, "evicted", conn)
         if closed:
             logger.info(
                 f"[PaperTrader] Evicted #{weakest['id']} {weakest['symbol']} "

@@ -243,7 +243,8 @@ class WhaleAlertService:
                         },
                         sl_pct=ba.trade_signal.get("stop_loss_pct"),
                         tp_pct=ba.trade_signal.get("take_profit_pct"),
-                        volume_24h=ba.analysis.volume_24h)
+                        volume_24h=ba.analysis.volume_24h,
+                        current_prices=current_prices)
         if breakout_alerts:
             logger.warning(f"⚡ {len(breakout_alerts)} 突发拉盘")
 
@@ -268,7 +269,8 @@ class WhaleAlertService:
                     },
                     sl_pct=a.trade_signal.get("stop_loss_pct"),
                     tp_pct=a.trade_signal.get("take_profit_pct"),
-                    volume_24h=a.analysis.volume_24h)
+                    volume_24h=a.analysis.volume_24h,
+                    current_prices=current_prices)
         for cd in crash_alerts:
             if hasattr(cd, 'trade_signal') and cd.trade_signal:
                 price = current_prices.get(cd.symbol, {}).get("price", 0)
@@ -279,7 +281,8 @@ class WhaleAlertService:
                         alert_data={"score": 0, "phase": ""},
                         sl_pct=cd.trade_signal.get("stop_loss_pct"),
                         tp_pct=cd.trade_signal.get("take_profit_pct"),
-                        volume_24h=vol)
+                        volume_24h=vol,
+                        current_prices=current_prices)
 
         # ══════════════════════════════════════════════════════════════
         # STEP 3: 事件检测 — 暴涨/暴跌/误报 并行
