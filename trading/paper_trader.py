@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class SignalTier(Enum):
     """Signal confidence tier based on control_score + pump_probability"""
     STRONG = "strong"      # score >= 65
-    MEDIUM = "medium"      # score >= 50
+    MEDIUM = "medium"      # score >= 53 (raised from 50 for better quality)
     WEAK = "weak"          # score >= 40 (minimum to trade)
 
 
@@ -38,7 +38,7 @@ class TierConfig:
 TIER_CONFIGS = {
     SignalTier.STRONG: TierConfig(
         sl_pct=6.0, tp_pct=18.0,
-        trailing_activate_pct=4.0, trailing_distance_pct=2.5,
+        trailing_activate_pct=2.5, trailing_distance_pct=2.5,  # trailing_activate_pct lowered from 4.0 to 2.5
         max_hold_hours=36.0, position_size_multiplier=2.0,
     ),
     SignalTier.MEDIUM: TierConfig(
@@ -47,7 +47,7 @@ TIER_CONFIGS = {
         max_hold_hours=48.0, position_size_multiplier=1.5,
     ),
     SignalTier.WEAK: TierConfig(
-        sl_pct=10.0, tp_pct=10.0,
+        sl_pct=8.0, tp_pct=12.0,  # Changed to 1:1.5 R:R (SL=8%, TP=12%) from 1:1 (SL=10%, TP=10%)
         trailing_activate_pct=6.0, trailing_distance_pct=5.0,
         max_hold_hours=36.0, position_size_multiplier=1.0,
     ),
@@ -60,10 +60,10 @@ class TradeConfig:
     risk_per_trade_pct: float = 2.0
     max_open_positions: int = 8
     min_alert_score: int = 40
-    min_volume_24h: float = 200_000  # minimum 24h volume (USDT) — CAKEUSDT lesson: $60K too illiquid
+    min_volume_24h: float = 500_000  # minimum 24h volume (USDT) — CAKEUSDT lesson: $60K too illiquid, raised to 500K for better liquidity
     # Score deterioration exit thresholds
-    score_exit_warning: int = 25     # close if score drops below this
-    score_exit_force: int = 15       # force close regardless of PnL
+    score_exit_warning: int = 35     # close if score drops below this (raised from 25)
+    score_exit_force: int = 25       # force close regardless of PnL (raised from 15)
     # Eviction: allow evicting weakest position for a stronger signal
     eviction_enabled: bool = True
     eviction_min_score_gap: int = 10  # new signal must be 10+ pts above weakest
@@ -116,7 +116,7 @@ def classify_tier(control_score: int, pump_probability: int = 0) -> SignalTier:
     """Classify signal strength into a tier"""
     if control_score >= 65:
         return SignalTier.STRONG
-    elif control_score >= 50:
+    elif control_score >= 53:  # Raised from 50 to 53
         return SignalTier.MEDIUM
     else:
         return SignalTier.WEAK
@@ -210,6 +210,7 @@ class PaperTrader:
         sl_pct: Optional[float] = None,
         tp_pct: Optional[float] = None,
         volume_24h: float = 0,
+        current_prices: Optional[Dict[str, float]] = None,
     ) -> Optional[TradeData]:
         """Open a new trading position with dynamic sizing and tier-based SL/TP"""
         if direction not in ("long", "short"):
@@ -258,7 +259,7 @@ class PaperTrader:
             if len(open_trades) >= self.config.max_open_positions:
                 # Eviction: check if new signal is strong enough to replace weakest
                 if self.config.eviction_enabled:
-                    evicted = self._try_evict(open_trades, alert_score, conn)
+                    evicted = self._try_evict(open_trades, alert_score, conn, current_prices)
                     if not evicted:
                         logger.info(f"[PaperTrader] Max positions ({self.config.max_open_positions}) reached, no eviction candidate")
                         return None
@@ -317,7 +318,8 @@ class PaperTrader:
 
         return self._get_trade_by_id(trade_id)
 
-    def _try_evict(self, open_trades, new_score: int, conn) -> bool:
+    def _try_evict(self, open_trades, new_score: int, conn,
+                    current_prices: Optional[Dict[str, float]] = None) -> bool:
         """Try to evict the weakest position for a stronger signal"""
         # Find weakest: lowest score, break ties by worst PnL
         weakest = None
@@ -330,10 +332,25 @@ class PaperTrader:
         if weakest is None:
             return False
 
-        # Close the weakest position at "eviction"
+        # Close the weakest position at actual market price (not entry price)
         now_ms = int(datetime.now().timestamp() * 1000)
-        # We don't have current price here, use entry price (will be updated on next check)
-        closed = self._close_trade(weakest["id"], 0, now_ms, "evicted", conn)
+        evict_price = 0
+        if current_prices:
+            cp = current_prices.get(weakest["symbol"], 0)
+            if isinstance(cp, dict):
+                cp = cp.get("price", 0)
+            if cp > 0:
+                evict_price = cp
+
+        # If we can't get the current price, skip eviction to avoid $0 PnL bug
+        if evict_price <= 0:
+            logger.warning(
+                f"[PaperTrader] Cannot evict #{weakest['id']} {weakest['symbol']}: "
+                f"current price unavailable (not in price dict). Skipping eviction."
+            )
+            return False
+
+        closed = self._close_trade(weakest["id"], evict_price, now_ms, "evicted", conn)
         if closed:
             logger.info(
                 f"[PaperTrader] Evicted #{weakest['id']} {weakest['symbol']} "
@@ -377,29 +394,29 @@ class PaperTrader:
                 else:
                     price_change_pct = ((trade.entry_price - current_price) / trade.entry_price) * 100
 
-                # ── 1. Hard Stop Loss ──
-                if price_change_pct <= -trade.stop_loss_pct:
+                # ── 1. Gap Protection (Highest Priority) ──
+                # If loss exceeds gap_max_loss_pct, close immediately regardless of SL
+                # This catches overnight crashes where price gapped past the stop-loss
+                if price_change_pct <= -self.config.gap_max_loss_pct:
+                    close_reason = "gap_crash"
+
+                # ── 2. Hard Stop Loss ──
+                elif price_change_pct <= -trade.stop_loss_pct:
                     close_reason = "stop_loss"
 
-                # ── 2. Take Profit ──
+                # ── 3. Take Profit ──
                 elif price_change_pct >= trade.take_profit_pct:
                     close_reason = "take_profit"
 
-                # ── 3. Trailing Stop ──
+                # ── 4. Trailing Stop ──
                 if not close_reason:
                     close_reason = self._check_trailing_stop(trade, current_price, price_change_pct, conn)
 
-                # ── 3.5. Gap Protection ──
-                # If loss exceeds gap_max_loss_pct, close immediately regardless of SL
-                # This catches overnight crashes where price gapped past the stop-loss
-                if not close_reason and price_change_pct <= -self.config.gap_max_loss_pct:
-                    close_reason = "gap_crash"
-
-                # ── 4. Score Deterioration Exit ──
+                # ── 5. Score Deterioration Exit ──
                 if not close_reason and latest_scores:
                     close_reason = self._check_score_exit(trade, latest_scores, price_change_pct)
 
-                # ── 5. Timeout ──
+                # ── 6. Timeout ──
                 if not close_reason:
                     entry_time_sec = trade.entry_time / 1000
                     now_sec = now_ms / 1000

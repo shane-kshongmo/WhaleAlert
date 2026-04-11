@@ -440,19 +440,35 @@ class AutoDiscoveryScanner:
 
         比 main.py 中的近似值更准确
         """
+        import time
         tickers = await self._fetch_all_tickers()
         result = {}
+
+        # Get historical average volumes from snapshots (last 7 days)
+        cutoff_time = int((time.time() - 7 * 24 * 3600) * 1000)
+        with self.store._conn() as conn:
+            avg_volumes = dict(conn.execute("""
+                SELECT symbol, AVG(volume_24h) as avg_vol
+                FROM snapshots
+                WHERE timestamp > ?
+                GROUP BY symbol
+            """, (cutoff_time,)).fetchall())
+
         for t in WATCH_TOKENS:
             ticker = tickers.get(t.symbol)
             if not ticker:
                 continue
+
+            # Use 7-day average from snapshots, fallback to current volume
+            avg_vol = avg_volumes.get(t.symbol, ticker.quote_volume)
+
             result[t.symbol] = {
                 "price": ticker.price,
                 "change_24h": ticker.change_pct,
                 "change_1h": 0,    # ticker 不提供, 需要 K线
                 "change_4h": 0,
                 "volume_current": ticker.quote_volume,
-                "volume_avg": ticker.quote_volume,  # 简化
+                "volume_avg": avg_vol,  # ✅ FIXED: Use historical average (was: ticker.quote_volume)
                 "trades_24h": ticker.trades,
                 "price_range_pct": ticker.price_range_pct,
             }

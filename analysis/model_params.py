@@ -75,6 +75,10 @@ class ModelParams:
     phase_large_orders_min: int = 10
     phase_bb_squeeze_width: float = 5.0
 
+    # ═══ 市场筛选参数 ═══
+    min_volume_24h: int = 500000              # 最低 24h 成交额 (USDT) - P1-2: 提高到 500K
+    large_cap_score_penalty: int = 20         # 大盘股扣分 - P1-3: 消除 LTC/DOGE 等误报
+
     def get_weight(self, dimension: str) -> DimensionWeight:
         """按维度名获取权重"""
         mapping = {

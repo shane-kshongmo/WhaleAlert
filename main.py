@@ -152,6 +152,18 @@ class WhaleAlertService:
                         whale.pump_probability = max(rule_prob, ml_prob)
                     self._feature_cache[sym] = ml["features"]
 
+                    # P0-B: 保存待标签ML样本 (24h后验证)
+                    # 每次扫描保存样本, 标签将在24h后通过前向价格验证生成
+                    try:
+                        self.ml.save_ml_sample_pending(
+                            symbol=sym,
+                            features=ml["features"],
+                            entry_price=whale.price,
+                            timestamp=ts
+                        )
+                    except Exception as e:
+                        logger.debug(f"[ML] Failed to save pending sample for {sym}: {e}")
+
                     # 存储
                     self.store.save_snapshot({
                         "symbol": sym, "timestamp": ts,
@@ -243,7 +255,8 @@ class WhaleAlertService:
                         },
                         sl_pct=ba.trade_signal.get("stop_loss_pct"),
                         tp_pct=ba.trade_signal.get("take_profit_pct"),
-                        volume_24h=ba.analysis.volume_24h)
+                        volume_24h=ba.analysis.volume_24h,
+                        current_prices=current_prices)
         if breakout_alerts:
             logger.warning(f"⚡ {len(breakout_alerts)} 突发拉盘")
 
@@ -268,7 +281,8 @@ class WhaleAlertService:
                     },
                     sl_pct=a.trade_signal.get("stop_loss_pct"),
                     tp_pct=a.trade_signal.get("take_profit_pct"),
-                    volume_24h=a.analysis.volume_24h)
+                    volume_24h=a.analysis.volume_24h,
+                    current_prices=current_prices)
         for cd in crash_alerts:
             if hasattr(cd, 'trade_signal') and cd.trade_signal:
                 price = current_prices.get(cd.symbol, {}).get("price", 0)
@@ -279,7 +293,8 @@ class WhaleAlertService:
                         alert_data={"score": 0, "phase": ""},
                         sl_pct=cd.trade_signal.get("stop_loss_pct"),
                         tp_pct=cd.trade_signal.get("take_profit_pct"),
-                        volume_24h=vol)
+                        volume_24h=vol,
+                        current_prices=current_prices)
 
         # ══════════════════════════════════════════════════════════════
         # STEP 3: 事件检测 — 暴涨/暴跌/误报 并行
@@ -359,6 +374,16 @@ class WhaleAlertService:
                         f"R={r.get('recall',0):.1%}")
             except Exception as e:
                 logger.error(f"[ML] {e}", exc_info=True)
+
+        # P0-B: Process pending ML samples (every 6 scans = ~90 minutes)
+        # 为待标签样本生成真实标签 (前向价格验证)
+        if self._scan_count % 6 == 0:
+            try:
+                labeled_count = self.ml.label_pending_samples(older_than_hours=24)
+                if labeled_count > 0:
+                    logger.info(f"[ML] Labeled {labeled_count} pending samples via 24h forward verification")
+            except Exception as e:
+                logger.error(f"[ML] Failed to label pending samples: {e}", exc_info=True)
 
         now = datetime.now()
         if now.hour == 8 and now.minute < SCAN_INTERVAL_MINUTES + 1:
