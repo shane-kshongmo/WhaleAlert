@@ -36,9 +36,9 @@ logger = logging.getLogger(__name__)
 # 特征工程
 # ═══════════════════════════════════════════════════════════════════════════
 
-# 完整特征列表 (41维)
+# 完整特征列表 (42维)
 FEATURE_NAMES = [
-    # ── 规则引擎输出 (8维得分) ──
+    # ── 规则引擎输出 (9维得分) ──
     "dim_accumulation",     # 缩量横盘得分
     "dim_large_orders",     # 大单占比得分
     "dim_imbalance",        # 买卖不平衡得分
@@ -46,6 +46,7 @@ FEATURE_NAMES = [
     "dim_wash_trade",       # 对倒交易得分
     "dim_concentration",    # 筹码集中得分
     "dim_spread",           # 价差异常得分
+    "dim_funding_rate",     # 资金费率得分
     "dim_momentum",         # 动量构建得分
     "control_score",        # 规则引擎总分
     "rule_pump_prob",       # 规则引擎概率
@@ -91,13 +92,21 @@ FEATURE_NAMES = [
     "btc_change_24h",       # BTC 24h change
     "btc_rsi",              # BTC RSI
 
+    # ── 市值层级 ──
+    "log_market_cap_tier",  # log market cap tier (1=small, 2=mid, 3=large)
+
+    # ── 时间特征 ──
+    "hour_sin",             # hour of day (sine encoding)
+    "hour_cos",             # hour of day (cosine encoding)
+    "is_asia_session",      # 1 if Asia trading session
+
     # ── 实时特征 (从 realtime_engine) ──
     "rt_volume_surge_5m",   # 5分钟成交量突增
     "rt_price_change_5m",   # 5分钟价格变化
     "rt_bid_ask_imbalance", # 买卖盘不平衡 (实时)
 ]
 
-NUM_FEATURES = 41
+NUM_FEATURES = 47
 
 
 def extract_features(
@@ -165,6 +174,28 @@ def extract_features(
     rt_price_change_5m = realtime_metrics.get("price_change_5m", 0.0) if realtime_metrics else 0.0
     rt_bid_ask_imbalance = realtime_metrics.get("bid_ask_imbalance", 0.5) if realtime_metrics else 0.5
 
+    # ── 新增: 市值层级 ──
+    # Estimate market cap tier from 24h volume (rough approximation)
+    # Small cap: <10M, Mid cap: 10M-500M, Large cap: >500M
+    vol_24h = wa.volume_24h if hasattr(wa, 'volume_24h') else ind.vol_current
+    if vol_24h < 10_000_000:
+        market_cap_tier = 1.0  # small cap
+    elif vol_24h < 500_000_000:
+        market_cap_tier = 2.0  # mid cap
+    else:
+        market_cap_tier = 3.0  # large cap
+    log_market_cap_tier = float(market_cap_tier)
+
+    # ── 新增: 时间特征 ──
+    import datetime
+    utc_now = datetime.datetime.utcnow()
+    hour = utc_now.hour
+    # Sine/cosine encoding for cyclical hour feature
+    hour_sin = float(np.sin(2 * np.pi * hour / 24))
+    hour_cos = float(np.cos(2 * np.pi * hour / 24))
+    # Asia session: 00:00-08:00 UTC
+    is_asia_session = 1.0 if 0 <= hour < 8 else 0.0
+
     features = np.array([
         # 规则引擎输出
         float(wa.dim_accumulation),
@@ -174,6 +205,7 @@ def extract_features(
         float(wa.dim_wash_trade),
         float(wa.dim_concentration),
         float(wa.dim_spread),
+        float(wa.dim_funding_rate),
         float(wa.dim_momentum),
         float(wa.control_score),
         float(wa.pump_probability),
@@ -218,6 +250,14 @@ def extract_features(
         # 市场背景
         float(btc_change_24h),
         float(btc_rsi),
+
+        # 市值层级
+        log_market_cap_tier,
+
+        # 时间特征
+        hour_sin,
+        hour_cos,
+        is_asia_session,
 
         # 实时特征
         float(rt_volume_surge_5m),
@@ -1042,7 +1082,9 @@ class PredictionManager:
                     label INTEGER,
                     actual_change REAL,
                     weight REAL DEFAULT 1.0,
-                    created_at INTEGER
+                    created_at INTEGER,
+                    entry_price REAL,
+                    label_verified INTEGER DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS ml_model_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1052,7 +1094,123 @@ class PredictionManager:
                     n_samples INTEGER,
                     trained_at INTEGER
                 );
+                CREATE TABLE IF NOT EXISTS pending_ml_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT,
+                    timestamp INTEGER,
+                    features_json TEXT,
+                    entry_price REAL,
+                    created_at INTEGER,
+                    labeled INTEGER DEFAULT 0
+                );
             """)
+
+    # ── 延迟标签系统 (P0-1: 修复循环标签) ────────────────────────────────
+
+    def save_ml_sample_pending(self, symbol: str, features: np.ndarray,
+                                entry_price: float, timestamp: int = 0):
+        """
+        保存待标签样本 - 标签将在24小时后通过前向价格验证生成
+
+        这是 P0-1 修复循环标签问题的核心实现:
+        - 样本记录时不带标签 (label=NULL)
+        - 记录入场价格用于后续计算 actual_change
+        - 24h 后通过 label_pending_samples() 验证并生成真实标签
+        """
+        import json
+        if timestamp == 0:
+            timestamp = int(time.time() * 1000)
+        now = int(time.time() * 1000)
+
+        with self.store._conn() as conn:
+            conn.execute("""
+                INSERT INTO pending_ml_samples
+                (symbol, timestamp, features_json, entry_price, created_at, labeled)
+                VALUES (?, ?, ?, ?, ?, 0)
+            """, (symbol, timestamp, json.dumps(features.tolist()), entry_price, now))
+
+    def label_pending_samples(self, older_than_hours: int = 24) -> int:
+        """
+        为待标签样本生成真实标签 (前向价格验证)
+
+        从 pending_ml_samples 表中找出 24h 前的样本:
+        1. 获取当前价格
+        2. 计算 actual_change = (current_price - entry_price) / entry_price
+        3. 生成标签: label=1 if actual_change >= 0.3 (30%) else 0
+        4. 将已标签样本移入 ml_training_samples 表
+
+        Returns:
+            int: 成功标签的样本数量
+        """
+        import json
+        cutoff_time_ms = int((time.time() - older_than_hours * 3600) * 1000)
+        labeled_count = 0
+
+        with self.store._conn() as conn:
+            # 获取所有需要标签的样本
+            rows = conn.execute("""
+                SELECT id, symbol, timestamp, features_json, entry_price
+                FROM pending_ml_samples
+                WHERE labeled = 0 AND timestamp < ?
+            """, (cutoff_time_ms,)).fetchall()
+
+            for row in rows:
+                sample_id = row["id"]
+                symbol = row["symbol"]
+                timestamp = row["timestamp"]
+                features = json.loads(row["features_json"])
+                entry_price = row["entry_price"]
+
+                # 获取当前价格 (从 indicators 或通过 API)
+                # 这里简化处理 - 实际应该调用 Binance API 获取最新价格
+                current_price = self._get_current_price(symbol)
+                if current_price is None:
+                    continue
+
+                # 计算实际涨跌幅
+                actual_change = (current_price - entry_price) / entry_price if entry_price > 0 else 0
+                label = 1 if actual_change >= 0.3 else 0  # 30% 阈值
+
+                # 移入正式训练表
+                now = int(time.time() * 1000)
+                conn.execute("""
+                    INSERT INTO ml_training_samples
+                    (symbol, timestamp, features_json, label, actual_change, weight,
+                     created_at, entry_price, label_verified)
+                    VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, 1)
+                """, (symbol, timestamp, json.dumps(features), label, actual_change,
+                     now, entry_price))
+
+                # 标记为已标签
+                conn.execute("UPDATE pending_ml_samples SET labeled = 1 WHERE id = ?", (sample_id,))
+                labeled_count += 1
+
+        return labeled_count
+
+    def _get_current_price(self, symbol: str) -> Optional[float]:
+        """获取代币当前价格 (用于标签验证)"""
+        import httpx
+        try:
+            async def fetch():
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"https://data-api.binance.vision/api/v3/ticker/price?symbol={symbol}"
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    return float(data.get("price", 0))
+
+            # 同步执行
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            return loop.run_until_complete(fetch())
+        except Exception as e:
+            logger.warning(f"[ML] Failed to fetch price for {symbol}: {e}")
+            return None
 
     # ── 预测 (对外接口) ──────────────────────────────────────────────────
 
@@ -1125,8 +1283,8 @@ class PredictionManager:
         for r in rows:
             try:
                 features = np.array(json.loads(r["features_json"]), dtype=np.float32)
-                # Accept old 30-feature or new 38-feature samples
-                if len(features) in (30, NUM_FEATURES):
+                # Accept old (30, 41, 42) or new (47) feature samples
+                if len(features) in (30, 41, 42, NUM_FEATURES):
                     samples.append(TrainingSample(
                         symbol=r["symbol"],
                         timestamp=r["timestamp"],
