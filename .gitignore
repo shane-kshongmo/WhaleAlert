@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+whale-alert.db
+whale_alert.db
+
+# Logs
+logs/
+*.log
+
+# Models
+models/
+*.pkl
+*.joblib
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+.omc/
+.codex/
+state/
+
+# Environment
+.env
+
+# Generated
+AGENTS.md

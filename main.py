@@ -288,9 +288,15 @@ class WhaleAlertService:
                 price = current_prices.get(cd.symbol, {}).get("price", 0)
                 vol = current_prices.get(cd.symbol, {}).get("volume_current", 0)
                 if price > 0:
+                    crash_analysis = getattr(cd, "analysis", None)
                     self.trader.open_position(
                         symbol=cd.symbol, direction="short", price=price,
-                        alert_data={"score": 0, "phase": ""},
+                        alert_data={
+                            "score": crash_analysis.crash_score if crash_analysis else 0,
+                            "phase": crash_analysis.phase if crash_analysis else "",
+                            "crash_probability": crash_analysis.crash_probability if crash_analysis else 0,
+                            "signals": [s.to_dict() for s in crash_analysis.signals] if crash_analysis else [],
+                        },
                         sl_pct=cd.trade_signal.get("stop_loss_pct"),
                         tp_pct=cd.trade_signal.get("take_profit_pct"),
                         volume_24h=vol,

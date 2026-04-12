@@ -85,7 +85,7 @@ class AlertDecision:
     reason: str = ""
     urgency: str = "normal"
     message: str = ""
-    analysis: Optional[WhaleAnalysis] = None
+    analysis: Optional[WhaleAnalysis | CrashAnalysis] = None
     trade_signal: dict = None
 
 
@@ -429,7 +429,7 @@ class AlertEngine:
 
     def evaluate_crash(self, crash: CrashAnalysis) -> AlertDecision:
         """评估暴跌预警"""
-        decision = AlertDecision(symbol=crash.symbol)
+        decision = AlertDecision(symbol=crash.symbol, analysis=crash)
 
         if crash.crash_score < CAC.min_crash_score:
             decision.reason = f"出货分不足: {crash.crash_score} < {CAC.min_crash_score}"
@@ -461,6 +461,7 @@ class AlertEngine:
         decision.urgency = "critical"
         decision.message = self._build_crash_message(crash)
         decision.reason = "暴跌预警条件满足"
+        decision.trade_signal = crash.get_suggested_short_sl_tp()
         self._crash_cooldown[crash.symbol] = now
 
         logger.warning(
