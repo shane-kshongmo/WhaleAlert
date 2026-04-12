@@ -389,15 +389,16 @@ async function loadOverview(tokens) {
   const statsEl = document.getElementById('overview-stats');
   const topEl = document.querySelector('#top-tokens-table tbody');
 
-  // Fetch trade stats & alerts in parallel
-  const [tradeRes, alertRes] = await Promise.all([
+  // Fetch trade stats, open positions, & alerts in parallel
+  const [tradeRes, openRes, alertRes] = await Promise.all([
     fetch(API + '/api/trades/stats').then(r => r.json()).catch(() => ({})),
+    fetch(API + '/api/trades/open').then(r => r.json()).catch(() => ({count:0})),
     fetch(API + '/api/alerts?hours=24').then(r => r.json()).catch(() => ({count:0}))
   ]);
 
   const wr = tradeRes.win_rate || 0;
   const pnl = tradeRes.total_pnl_usd || 0;
-  const openCount = tradeRes.total_trades ? (tradeRes.total_trades - (tradeRes.closed_trades || 0)) : 0;
+  const openCount = openRes.count || 0;
 
   statsEl.innerHTML = `
     <div class="stat-card"><div class="label">Tokens Monitored</div><div class="value blue">${tokens.length}</div></div>

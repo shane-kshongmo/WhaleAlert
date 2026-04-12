@@ -98,6 +98,11 @@ class TradeData:
     signal_tier: str = "medium"              # strong/medium/weak
     trailing_activated: int = 0              # 0=no, 1=yes
     trailing_stop_price: float = 0.0
+    # Position scaling fields
+    initial_entry_price: Optional[float] = None   # First entry price
+    initial_entry_time: Optional[int] = None      # First entry timestamp
+    entry_count: int = 1                          # Number of entries (1-3)
+    entries_json: Optional[str] = None            # Array of entry details
 
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
@@ -184,6 +189,22 @@ class PaperTrader:
                 conn.execute("SELECT trailing_stop_price FROM paper_trades LIMIT 1")
             except sqlite3.OperationalError:
                 conn.execute("ALTER TABLE paper_trades ADD COLUMN trailing_stop_price REAL DEFAULT 0")
+            try:
+                conn.execute("SELECT initial_entry_price FROM paper_trades LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE paper_trades ADD COLUMN initial_entry_price REAL")
+            try:
+                conn.execute("SELECT initial_entry_time FROM paper_trades LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE paper_trades ADD COLUMN initial_entry_time INTEGER")
+            try:
+                conn.execute("SELECT entry_count FROM paper_trades LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE paper_trades ADD COLUMN entry_count INTEGER DEFAULT 1")
+            try:
+                conn.execute("SELECT entries_json FROM paper_trades LIMIT 1")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE paper_trades ADD COLUMN entries_json TEXT")
 
         logger.info("[PaperTrader] Database tables initialized")
 
@@ -223,7 +244,10 @@ class PaperTrader:
 
         alert_data = alert_data or {}
         alert_score = alert_data.get("score", alert_data.get("control_score", alert_data.get("alert_score", 0)))
-        alert_probability = alert_data.get("pump_probability", 0)
+        alert_probability = alert_data.get(
+            "pump_probability",
+            alert_data.get("crash_probability", alert_data.get("probability", 0))
+        )
 
         # Check minimum alert score
         if alert_score < self.config.min_alert_score:
@@ -267,17 +291,35 @@ class PaperTrader:
                     logger.info(f"[PaperTrader] Max positions ({self.config.max_open_positions}) reached")
                     return None
 
-            # Check for duplicate position (same symbol + direction)
-            duplicate = conn.execute(
-                "SELECT id FROM paper_trades WHERE symbol = ? AND direction = ? AND status = 'open'",
-                (symbol.upper(), direction)
-            ).fetchone()
-            if duplicate:
-                logger.info(f"[PaperTrader] Duplicate position: {symbol} {direction}")
+            # Check for existing position (opportunity to scale in)
+            existing = self._get_open_position(symbol, direction, conn)
+            if existing:
+                logger.info(f"[PaperTrader] Existing position found for {symbol} (#{existing.id})")
+
+                # Check if we should scale in
+                from config import POSITION_SCALING
+                can_scale, reason = self._can_scale_in(existing, alert_score, price)
+
+                if can_scale:
+                    logger.info(f"[PaperTrader] 🔍 Scaling opportunity: {symbol} score={alert_score} - {reason}")
+                    success = self._scale_in_position(existing, price, alert_score, conn)
+                    if success:
+                        row = conn.execute(
+                            "SELECT * FROM paper_trades WHERE id = ?",
+                            (existing.id,)
+                        ).fetchone()
+                        return self._row_to_trade(row) if row else self._get_trade_by_id(existing.id)
+                    else:
+                        logger.warning(f"[PaperTrader] Scale-in failed for {symbol}")
+                else:
+                    logger.info(f"[PaperTrader] ❌ Cannot scale in: {reason}")
+
+                # Don't open duplicate position
                 return None
 
             # Dynamic position sizing
             position_size_usd = self._calculate_position_size(tier, sl_pct)
+            now_ms = int(datetime.now().timestamp() * 1000)
 
             # Prepare alert data
             alert_phase = alert_data.get("phase", "unknown")
@@ -290,13 +332,17 @@ class PaperTrader:
                  pnl_pct, pnl_usd, alert_score, alert_phase, alert_probability,
                  alert_signals_json, stop_loss_pct, take_profit_pct, max_hold_hours,
                  peak_price, max_drawdown_pct, position_size_usd,
-                 signal_tier, trailing_activated, trailing_stop_price)
-                VALUES (?, ?, ?, ?, 'open', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)
+                 signal_tier, trailing_activated, trailing_stop_price,
+                 initial_entry_price, initial_entry_time, entry_count, entries_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol.upper(),
                 direction,
                 price,
-                int(datetime.now().timestamp() * 1000),
+                now_ms,
+                "open",
+                0,
+                0,
                 alert_score,
                 alert_phase,
                 alert_probability,
@@ -308,6 +354,19 @@ class PaperTrader:
                 0,
                 position_size_usd,
                 tier.value,
+                0,  # trailing_activated
+                0,  # trailing_stop_price
+                price,  # initial_entry_price
+                now_ms,  # initial_entry_time
+                1,  # entry_count
+                json.dumps([{
+                    'entry_time': now_ms,
+                    'price': price,
+                    'quantity': position_size_usd / price,
+                    'usd_value': position_size_usd,
+                    'score': alert_score,
+                    'reason': 'initial'
+                }], ensure_ascii=False)  # entries_json
             ))
 
             trade_id = cursor.lastrowid
@@ -440,8 +499,13 @@ class PaperTrader:
         tier = SignalTier(trade.signal_tier) if trade.signal_tier in ("strong", "medium", "weak") else SignalTier.MEDIUM
         tier_cfg = self._get_tier_params(tier)
 
-        # Update peak price
-        new_peak = max(trade.peak_price, current_price)
+        # Track the most favorable price seen so far:
+        # long -> highest price, short -> lowest price.
+        base_peak = trade.peak_price if trade.peak_price > 0 else trade.entry_price
+        if trade.direction == "long":
+            new_peak = max(base_peak, current_price)
+        else:
+            new_peak = min(base_peak, current_price)
 
         # Check if trailing should activate
         if not trade.trailing_activated:
@@ -504,10 +568,12 @@ class PaperTrader:
 
     def _update_peak_drawdown(self, trade: TradeData, current_price: float, conn):
         """Update peak price and max drawdown"""
-        new_peak = max(trade.peak_price, current_price)
+        baseline = trade.peak_price if trade.peak_price > 0 else trade.entry_price
         if trade.direction == "long":
+            new_peak = max(baseline, current_price)
             drawdown = ((new_peak - current_price) / new_peak) * 100 if new_peak > 0 else 0
         else:
+            new_peak = min(baseline, current_price)
             drawdown = ((current_price - new_peak) / new_peak) * 100 if new_peak > 0 else 0
         max_drawdown = max(trade.max_drawdown_pct, drawdown)
 
@@ -551,6 +617,145 @@ class PaperTrader:
 
         row = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (trade_id,)).fetchone()
         return self._row_to_trade(row)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Position Scaling (Pyramiding) Methods
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_open_position(self, symbol: str, direction: str, conn) -> Optional[TradeData]:
+        """Get existing open position for the same symbol and direction"""
+        row = conn.execute(
+            "SELECT * FROM paper_trades WHERE symbol = ? AND direction = ? AND status = 'open'",
+            (symbol.upper(), direction)
+        ).fetchone()
+
+        if row:
+            return self._row_to_trade(row)
+        return None
+
+    def _can_scale_in(self, position: TradeData, current_score: int,
+                        current_price: float) -> Tuple[bool, str]:
+        """Check if position meets all criteria for scaling in"""
+        from config import POSITION_SCALING
+
+        # Parse entries_json
+        try:
+            entries = json.loads(position.entries_json) if position.entries_json else []
+        except:
+            entries = []
+
+        # Check 1: Max scale-ins
+        if len(entries) >= POSITION_SCALING.max_scale_ins + 1:
+            return False, f"Max scale-ins reached ({len(entries)}/{POSITION_SCALING.max_scale_ins + 1})"
+
+        # Check 2: Min time interval between entries
+        if entries:
+            last_entry_time = max(e['entry_time'] for e in entries)
+            now_ms = int(datetime.now().timestamp() * 1000)
+            min_interval_ms = POSITION_SCALING.min_scale_interval_min * 60 * 1000
+
+            if now_ms - last_entry_time < min_interval_ms:
+                return False, f"Too soon since last entry ({(now_ms - last_entry_time) / 60000:.1f} < {POSITION_SCALING.min_scale_interval_min} min)"
+
+        # Check 3: Score improvement
+        initial_score = entries[0]['score'] if entries else current_score - 20
+        score_jump = current_score - initial_score
+
+        if score_jump < POSITION_SCALING.min_score_jump:
+            return False, f"Score jump insufficient (+{score_jump} < {POSITION_SCALING.min_score_jump})"
+
+        # Check 4: Minimum absolute score
+        if current_score < POSITION_SCALING.min_score_absolute:
+            return False, f"Score too low ({current_score} < {POSITION_SCALING.min_score_absolute})"
+
+        # Check 5: Price movement (don't chase)
+        if position.initial_entry_price and position.initial_entry_price > 0:
+            price_change_pct = abs((current_price - position.initial_entry_price) / position.initial_entry_price) * 100
+            if price_change_pct > POSITION_SCALING.max_price_change_pct:
+                return False, f"Price moved too much ({price_change_pct:.1f}% > {POSITION_SCALING.max_price_change_pct}%)"
+
+        # Check 6: Position size limit
+        current_value = position.position_size_usd if position.position_size_usd else 0
+        initial_value = entries[0].get('usd_value', current_value) if entries else current_value
+        scale_in_pcts = POSITION_SCALING.scale_in_percent
+        next_scale_pct = scale_in_pcts[min(len(entries) - 1, len(scale_in_pcts) - 1)] if entries else scale_in_pcts[0]
+        allowed_max = max(
+            POSITION_SCALING.max_position_usd,
+            initial_value * (1 + sum(scale_in_pcts))
+        )
+        prospective_value = current_value + (initial_value * next_scale_pct)
+        if prospective_value > allowed_max:
+            return False, f"Position size maxed (${prospective_value:.2f} > ${allowed_max:.2f})"
+
+        # All checks passed
+        return True, "All criteria met"
+
+    def _scale_in_position(self, position: TradeData, current_price: float,
+                          current_score: int, conn) -> bool:
+        """Add to existing position (pyramiding)"""
+        from config import POSITION_SCALING
+
+        try:
+            entries = json.loads(position.entries_json) if position.entries_json else []
+        except:
+            logger.error(f"[PaperTrader] Cannot parse entries_json for trade #{position.id}")
+            return False
+
+        entry_count = len(entries)
+
+        # Calculate scale-in size (pyramid: 50%, then 33%)
+        scale_in_pcts = POSITION_SCALING.scale_in_percent
+        scale_pct = scale_in_pcts[min(entry_count - 1, len(scale_in_pcts) - 1)]
+
+        initial_value = entries[0]['usd_value']
+        add_value = initial_value * scale_pct
+
+        # Track synthetic quantity for the entry ledger only
+        add_quantity = add_value / current_price
+
+        # Calculate new weighted average entry price
+        total_value = position.position_size_usd + add_value
+        weighted_price = ((position.entry_price * position.position_size_usd) +
+                          (current_price * add_value)) / total_value
+
+        # Create new entry record
+        new_entry = {
+            'entry_time': int(datetime.now().timestamp() * 1000),
+            'price': current_price,
+            'quantity': add_quantity,
+            'usd_value': add_value,
+            'score': current_score,
+            'reason': 'scale_in'
+        }
+
+        entries.append(new_entry)
+
+        # Update position
+        conn.execute("""
+            UPDATE paper_trades
+            SET entry_price = ?,
+                position_size_usd = ?,
+                entry_count = ?,
+                entries_json = ?,
+                alert_score = ?
+            WHERE id = ?
+        """, (
+            weighted_price,
+            total_value,
+            entry_count + 1,
+            json.dumps(entries),
+            current_score,
+            position.id
+        ))
+
+        logger.info(
+            f"[PaperTrader] 📈 SCALED INTO {position.symbol} #{position.id}: "
+            f"+${add_value:.2f} at ${current_price:.6f} (score {current_score}), "
+            f"total ${total_value:.2f} at ${weighted_price:.6f} avg, "
+            f"entry #{entry_count + 1}"
+        )
+
+        return True
 
     def get_stats(self, days: int = 30) -> Dict:
         """Calculate trading statistics"""
@@ -703,6 +908,15 @@ class PaperTrader:
             data['trailing_activated'] = 0
         if 'trailing_stop_price' not in data:
             data['trailing_stop_price'] = 0.0
+        # Position scaling fields
+        if 'initial_entry_price' not in data:
+            data['initial_entry_price'] = None
+        if 'initial_entry_time' not in data:
+            data['initial_entry_time'] = None
+        if 'entry_count' not in data:
+            data['entry_count'] = 1
+        if 'entries_json' not in data:
+            data['entries_json'] = None
         return TradeData(**data)
 
     def _get_trade_by_id(self, trade_id: int) -> Optional[TradeData]:

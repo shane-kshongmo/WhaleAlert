@@ -150,7 +150,7 @@ THRESHOLDS = DetectionThresholds()
 @dataclass
 class AlertConfig:
     """暴涨预警条件"""
-    min_control_score: int = 40
+    min_control_score: int = 35  # Lowered from 40 (2026-04-11) to catch pumps like 币安人生USDT's 64.7%
     min_signal_count: int = 3
     required_phases: List[str] = field(
         default_factory=lambda: [
@@ -182,6 +182,36 @@ class CrashAlertConfig:
 
 ALERT_CONFIG = AlertConfig()
 CRASH_ALERT_CONFIG = CrashAlertConfig()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Position Scaling (Pyramiding) — 加仓策略
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PositionScalingConfig:
+    """Position scaling parameters - Add to existing positions when scores improve"""
+
+    # Limits
+    max_position_usd: int = 1000              # Max total position size ($)
+    max_scale_ins: int = 2                    # Max additional entries (3 total)
+    min_scale_interval_min: int = 30          # Min minutes between entries
+
+    # Score requirements
+    min_score_jump: int = 15                   # Min score increase to trigger scale-in
+    min_score_absolute: int = 60               # Min absolute score for scale-in
+
+    # Price limits
+    max_price_change_pct: float = 2.0         # Max % price change from initial entry
+
+    # Position sizing (pyramid: decrease size with each addition)
+    scale_in_percent: list = field(default_factory=lambda: [0.5, 0.33])  # 50%, then 33%
+
+    # Risk controls
+    max_drawdown_pct: float = 8.0             # Max 8% drop → auto exit
+    time_stop_hours: float = 6.0              # Exit after 6h if stagnant
+    volatility_stop_pct: float = 5.0          # Exit if 5% swing in 15min
+
+POSITION_SCALING = PositionScalingConfig()
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 运行参数
