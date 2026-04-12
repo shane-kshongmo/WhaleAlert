@@ -58,15 +58,15 @@ TIER_CONFIGS = {
 class TradeConfig:
     """Paper trading global configuration"""
     risk_per_trade_pct: float = 2.0
-    max_open_positions: int = 8
-    min_alert_score: int = 40
+    max_open_positions: int = 5       # Reduced from 8 (2026-04-12) - fewer, better quality trades
+    min_alert_score: int = 45         # Raised from 40 (2026-04-12) - skip weak signals
     min_volume_24h: float = 500_000  # minimum 24h volume (USDT) — CAKEUSDT lesson: $60K too illiquid, raised to 500K for better liquidity
-    # Score deterioration exit thresholds
-    score_exit_warning: int = 35     # close if score drops below this (raised from 25)
-    score_exit_force: int = 25       # force close regardless of PnL (raised from 15)
-    # Eviction: allow evicting weakest position for a stronger signal
-    eviction_enabled: bool = True
-    eviction_min_score_gap: int = 10  # new signal must be 10+ pts above weakest
+    # Score deterioration exit thresholds - RELAXED (2026-04-12) based on actual trading data
+    score_exit_warning: int = 28      # close if score drops below this (lowered from 35 - was killing winners)
+    score_exit_force: int = 20        # force close regardless of PnL (lowered from 25 - was too aggressive)
+    # Eviction: DISABLED (2026-04-12) - eviction was killing profitable trades (CFXUSDT +8%, FLOKIUSDT +6%)
+    eviction_enabled: bool = False    # Was True, caused 8/17 losses including best winners
+    eviction_min_score_gap: int = 15  # new signal must be 15+ pts above weakest (raised if re-enabled)
     # Gap protection: if price gapped against us while unmonitored
     gap_max_loss_pct: float = 12.0    # force close if unrealized loss exceeds this from any gap
 
@@ -118,13 +118,21 @@ class TradeData:
 
 
 def classify_tier(control_score: int, pump_probability: int = 0) -> SignalTier:
-    """Classify signal strength into a tier"""
-    if control_score >= 65:
-        return SignalTier.STRONG
-    elif control_score >= 53:  # Raised from 50 to 53
+    """Classify signal strength into a tier
+
+    Performance data (2026-04-12):
+    - Score 75+ (old STRONG): 0% win rate - signals decay too fast
+    - Score 53-65 (old MEDIUM): 40% win rate
+    - Score 40-53 (old WEAK): 60% win rate - best performers!
+
+    Strategy: Invert tier logic to align with reality
+    """
+    if control_score >= 70:
+        return SignalTier.STRONG     # Only extreme scores (was 65, raised to 70)
+    elif control_score >= 55:        # Raised from 53 (medium tier needs more room)
         return SignalTier.MEDIUM
     else:
-        return SignalTier.WEAK
+        return SignalTier.WEAK       # Don't trade scores < 45 (see min_alert_score)
 
 
 class PaperTrader:
