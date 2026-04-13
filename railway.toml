@@ -1,0 +1,12 @@
+# Railway.app Deployment - Asia Optimized
+# Railway automatically detects this file for configuration
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+healthcheckPath = "/api/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

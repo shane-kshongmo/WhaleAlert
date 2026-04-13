@@ -1,0 +1,16 @@
+# nixpacks.toml - Railway.app Build Configuration
+# This tells Railway how to build your Python app
+
+[phases.build]
+cmds = ["pip install --upgrade pip && pip install -r requirements.txt"]
+
+[phases.start]
+cmds = ["python main.py"]
+
+[start]
+cmd = "python main.py"
+
+[variables]
+PYTHONUNBUFFERED = "1"
+SCAN_INTERVAL_MINUTES = "15"
+PORT = "8888"

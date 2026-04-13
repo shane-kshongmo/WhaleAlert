@@ -1,0 +1,39 @@
+name: whale-alert-service
+regions:
+  - was      # Washington DC (US East)
+  - par      # Paris (EU) - alternative
+services:
+  - name: whale-alert
+    type: web
+    env: python
+    build_command: pip install --upgrade pip && pip install -r requirements.txt
+    run_command: python main.py
+    github:
+      repo: shane-kshongmo/WhaleAlert
+      branch: main
+    instance_type: nano
+    min_instances: 1
+    max_instances: 1
+    ports:
+      - port: 8888
+        protocol: HTTP
+    env_vars:
+      - name: PYTHONUNBUFFERED
+        value: "1"
+      - name: SCAN_INTERVAL_MINUTES
+        value: "15"
+    routes:
+      - path: /
+        port: 8888
+    health_check:
+      http:
+        port: 8888
+        path: /api/health
+        interval: 60s
+        timeout: 10s
+        unhealthy_threshold: 3
+        healthy_threshold: 1
+    volumes:
+      - name: data
+      - mount_path: /opt/whale-alert
+      - size: 5GB

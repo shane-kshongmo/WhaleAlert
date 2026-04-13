@@ -532,10 +532,11 @@ async function loadTokenCards(tokens) {
 }
 
 async function loadStats() {
+  const timestamp = Date.now();
   const [tradeRes, pumpRes, alertRes] = await Promise.all([
-    fetch(API + '/api/trades/stats').then(r => r.json()).catch(() => ({})),
-    fetch(API + '/api/learning/stats').then(r => r.json()).catch(() => ({})),
-    fetch(API + '/api/alerts?hours=72').then(r => r.json()).catch(() => ({alerts:[]}))
+    fetch(API + '/api/trades/stats?' + timestamp).then(r => r.json()).catch(() => ({})),
+    fetch(API + '/api/learning/stats?' + timestamp).then(r => r.json()).catch(() => ({})),
+    fetch(API + '/api/alerts?hours=72&' + timestamp).then(r => r.json()).catch(() => ({alerts:[]}))
   ]);
 
   // Trade stats cards
@@ -565,6 +566,7 @@ async function loadStats() {
 
   // Pump stats cards
   const psEl = document.getElementById('pump-stats');
+  const pumpTimestamp = new Date().toLocaleTimeString();
   psEl.innerHTML = `
     <div class="stat-card"><div class="label">Pump Events (30d)</div><div class="value">${pumpRes.total_pumps || 0}</div></div>
     <div class="stat-card"><div class="label">Predicted</div><div class="value green">${pumpRes.predicted || 0}</div></div>
@@ -573,6 +575,7 @@ async function loadStats() {
     <div class="stat-card"><div class="label">Precision</div><div class="value">${(pumpRes.precision || 0).toFixed(1)}%</div></div>
     <div class="stat-card"><div class="label">Recall</div><div class="value">${(pumpRes.recall || 0).toFixed(1)}%</div></div>
     <div class="stat-card"><div class="label">False Positives</div><div class="value red">${pumpRes.false_positives || 0}</div></div>
+    <div class="stat-card" style="grid-column:span 3"><div class="label" style="font-size:11px;color:#5a6a8a">Updated: ${pumpTimestamp}</div></div>
   `;
 
   // Alerts table
