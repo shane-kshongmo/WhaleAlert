@@ -280,7 +280,7 @@ class TrainingSample:
     symbol: str
     timestamp: int
     features: np.ndarray       # shape=(38,)
-    label: int                 # 1=24h内涨≥50%, 0=未涨
+    label: int                 # 1=24h内涨≥10%, 0=未涨 (lowered from 30% — 30% produced 1 positive in 30 days)
     actual_change: float       # 24h实际涨跌幅
     weight: float = 1.0        # 样本权重 (正样本加权)
 
@@ -493,6 +493,17 @@ class GBDTPredictor(BasePredictor):
 
         # Count positive samples
         n_positive = int(y.sum())
+
+        # Require at least 5 positive samples — with fewer, GBDT memorises them and
+        # recall stays 0% on any unseen positive. (label threshold lowered to 10%
+        # to accumulate positives faster; don't train until we have enough.)
+        MIN_POSITIVE = 5
+        if n_positive < MIN_POSITIVE:
+            logger.info(
+                f"[GBDT] Skipping training: only {n_positive} positive samples "
+                f"(need ≥{MIN_POSITIVE}). Waiting for more 10%+ pump events."
+            )
+            return None
 
         # Handle feature dimension mismatch (old 30-feature samples vs new 38)
         if X.shape[1] < NUM_FEATURES:
@@ -1136,7 +1147,8 @@ class PredictionManager:
         从 pending_ml_samples 表中找出 24h 前的样本:
         1. 获取当前价格
         2. 计算 actual_change = (current_price - entry_price) / entry_price
-        3. 生成标签: label=1 if actual_change >= 0.3 (30%) else 0
+        3. 生成标签: label=1 if actual_change >= 0.10 (10%) else 0
+           (lowered from 30%: only 1 positive sample in 30 days at 30% threshold)
         4. 将已标签样本移入 ml_training_samples 表
 
         Returns:
@@ -1169,7 +1181,10 @@ class PredictionManager:
 
                 # 计算实际涨跌幅
                 actual_change = (current_price - entry_price) / entry_price if entry_price > 0 else 0
-                label = 1 if actual_change >= 0.3 else 0  # 30% 阈值
+                label = 1 if actual_change >= 0.10 else 0  # 10% threshold (was 30% — too rare)
+
+                # Positive samples are rare; upweight them to counteract class imbalance
+                weight = 4.0 if label == 1 else 1.0
 
                 # 移入正式训练表
                 now = int(time.time() * 1000)
@@ -1177,9 +1192,9 @@ class PredictionManager:
                     INSERT INTO ml_training_samples
                     (symbol, timestamp, features_json, label, actual_change, weight,
                      created_at, entry_price, label_verified)
-                    VALUES (?, ?, ?, ?, ?, 1.0, ?, ?, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """, (symbol, timestamp, json.dumps(features), label, actual_change,
-                     now, entry_price))
+                     weight, now, entry_price))
 
                 # 标记为已标签
                 conn.execute("UPDATE pending_ml_samples SET labeled = 1 WHERE id = ?", (sample_id,))
