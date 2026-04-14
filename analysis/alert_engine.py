@@ -107,11 +107,12 @@ class AlertEngine:
         symbol = analysis.symbol
 
         # ML confidence gating: adjust base minimum score
-        # During cold start (model untrained), use base threshold directly
+        # Cold start (untrained model) now raises threshold — firing at full
+        # confidence with an untrained model was causing systematic false positives.
         if ml_confidence == "high":
             base_min = max(50, AC.min_control_score - 5)
         elif ml_confidence == "low":
-            base_min = AC.min_control_score  # cold start: no penalty
+            base_min = AC.min_control_score + 10  # untrained = stricter, not neutral
         else:
             base_min = AC.min_control_score
 

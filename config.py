@@ -150,20 +150,19 @@ THRESHOLDS = DetectionThresholds()
 @dataclass
 class AlertConfig:
     """暴涨预警条件"""
-    min_control_score: int = 35  # Lowered from 40 (2026-04-11) to catch pumps like 币安人生USDT's 64.7%
+    min_control_score: int = 50  # Raised from 35 (2026-04-14): 478 alerts at 35 → 335 FPs (70%); 50 filters noise phases
     min_signal_count: int = 3
     required_phases: List[str] = field(
         default_factory=lambda: [
-            "吸筹末期",
-            "即将拉盘",
-            "高度控盘",
-            "疑似吸筹",
-            "中度控盘",
-            "轻度异常",
+            "吸筹末期",    # Late accumulation — strong evidence
+            "即将拉盘",    # Imminent pump — strongest signal
+            "高度控盘",    # Heavy manipulation confirmed
+            # Removed: "疑似吸筹", "中度控盘", "轻度异常" — these 3 generated
+            # the bulk of 335 false positives; not reliable trade entry phases
         ]
     )
     cooldown_hours: float = 4.0
-    min_pump_probability: int = 25
+    min_pump_probability: int = 30  # Raised from 25 — with circular prob formula, 25% = near-zero real conviction
 
 @dataclass
 class CrashAlertConfig:

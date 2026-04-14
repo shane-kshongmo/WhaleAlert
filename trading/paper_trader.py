@@ -31,25 +31,26 @@ class TierConfig:
     position_size_multiplier: float
 
 
-# Tier configs calibrated for whale manipulation patterns:
-# STRONG: tight stops, wide targets (whales push hard when confident)
-# MEDIUM: standard stops/targets
-# WEAK: wider stops (more noise), modest targets
+# Tier configs — P1 rebalanced 2026-04-14:
+# - Multipliers INVERTED to match observed win rates (WEAK=60%, MEDIUM=38%, STRONG=0%)
+# - Trailing activation widened: altcoin noise routinely exceeds old 2.5-5% thresholds,
+#   causing premature exits before the actual pump move materialises
+# - STRONG tier is disabled upstream (open_position returns None); config kept for reference
 TIER_CONFIGS = {
     SignalTier.STRONG: TierConfig(
         sl_pct=6.0, tp_pct=18.0,
-        trailing_activate_pct=2.5, trailing_distance_pct=2.5,  # trailing_activate_pct lowered from 4.0 to 2.5
-        max_hold_hours=36.0, position_size_multiplier=2.0,
+        trailing_activate_pct=10.0, trailing_distance_pct=4.0,  # widened: was 2.5/2.5
+        max_hold_hours=36.0, position_size_multiplier=0.5,       # was 2.0 — disabled anyway
     ),
     SignalTier.MEDIUM: TierConfig(
         sl_pct=8.0, tp_pct=14.0,
-        trailing_activate_pct=5.0, trailing_distance_pct=3.5,
-        max_hold_hours=48.0, position_size_multiplier=1.5,
+        trailing_activate_pct=8.0, trailing_distance_pct=4.0,   # widened: was 5.0/3.5
+        max_hold_hours=48.0, position_size_multiplier=1.5,       # unchanged
     ),
     SignalTier.WEAK: TierConfig(
-        sl_pct=8.0, tp_pct=12.0,  # Changed to 1:1.5 R:R (SL=8%, TP=12%) from 1:1 (SL=10%, TP=10%)
-        trailing_activate_pct=6.0, trailing_distance_pct=5.0,
-        max_hold_hours=36.0, position_size_multiplier=1.0,
+        sl_pct=8.0, tp_pct=12.0,
+        trailing_activate_pct=6.0, trailing_distance_pct=5.0,   # unchanged (already widest)
+        max_hold_hours=36.0, position_size_multiplier=2.0,       # was 1.0 — best performers get more
     ),
 }
 
@@ -270,6 +271,17 @@ class PaperTrader:
 
         # Determine signal tier
         tier = classify_tier(alert_score, alert_probability)
+
+        # STRONG tier disabled: 0% win rate empirically (2026-04-14)
+        # High-score signals appear to fire at market tops, not accumulation bottoms.
+        # Re-enable only after scoring lookahead bias is audited and corrected.
+        if tier == SignalTier.STRONG:
+            logger.info(
+                f"[PaperTrader] STRONG tier disabled — {symbol} score={alert_score} "
+                f"(0% historical win rate, suspected top-detection bias)"
+            )
+            return None
+
         tier_cfg = self._get_tier_params(tier)
 
         # Dynamic SL/TP: use provided values or fall back to tier defaults
@@ -283,6 +295,18 @@ class PaperTrader:
             tp_pct = sl_pct * 1.5
 
         with self.store._conn() as conn:
+            # Account drawdown circuit breaker: halt new trades if realized losses exceed 15%
+            realized_pnl = conn.execute(
+                "SELECT COALESCE(SUM(pnl_usd), 0) FROM paper_trades WHERE status = 'closed'"
+            ).fetchone()[0]
+            drawdown_limit = -(self.initial_capital * 0.15)
+            if realized_pnl < drawdown_limit:
+                logger.warning(
+                    f"[PaperTrader] Drawdown halt: realized PnL ${realized_pnl:.2f} "
+                    f"< {drawdown_limit:.2f} (-15% of ${self.initial_capital:.0f}). No new positions."
+                )
+                return None
+
             # Check max open positions
             open_trades = conn.execute(
                 "SELECT id, symbol, alert_score, pnl_pct FROM paper_trades WHERE status = 'open'"
@@ -559,17 +583,24 @@ class PaperTrader:
 
     def _check_score_exit(self, trade: TradeData, latest_scores: Dict[str, int],
                            price_change_pct: float) -> Optional[str]:
-        """Check if control score has deteriorated enough to exit"""
+        """Check if control score has deteriorated enough to exit.
+
+        Thresholds are now relative to entry score, not absolute values.
+        Absolute thresholds (score_exit_warning=28, score_exit_force=20) were
+        below min_alert_score=45, making score-crash/deterioration dead code.
+        """
         score = latest_scores.get(trade.symbol)
         if score is None:
             return None
 
-        # Force exit if score crashed
-        if score < self.config.score_exit_force:
+        entry_score = trade.alert_score or self.config.min_alert_score
+
+        # Force exit if score collapsed 25+ pts from entry (whale exited position)
+        if score < entry_score - 25:
             return "score_crash"
 
-        # Warning exit: score dropped and position is losing
-        if score < self.config.score_exit_warning and price_change_pct < 0:
+        # Warning exit: score dropped 15+ pts and position is losing
+        if score < entry_score - 15 and price_change_pct < 0:
             return "score_deterioration"
 
         return None
@@ -645,6 +676,16 @@ class PaperTrader:
                         current_price: float) -> Tuple[bool, str]:
         """Check if position meets all criteria for scaling in"""
         from config import POSITION_SCALING
+
+        # Check 0: Never average down on a losing position
+        # If price moved against us, the thesis (whale accumulation) has failed.
+        if position.initial_entry_price and position.initial_entry_price > 0:
+            if position.direction == "long":
+                current_pnl_pct = (current_price - position.initial_entry_price) / position.initial_entry_price * 100
+            else:
+                current_pnl_pct = (position.initial_entry_price - current_price) / position.initial_entry_price * 100
+            if current_pnl_pct < 0:
+                return False, f"Position losing ({current_pnl_pct:.1f}%) — no averaging down"
 
         # Parse entries_json
         try:
