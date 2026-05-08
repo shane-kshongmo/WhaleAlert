@@ -78,6 +78,28 @@ WATCH_TOKENS: List[TokenConfig] = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Top-10 市值策略路由
+# ═══════════════════════════════════════════════════════════════════════════
+
+# BTC/ETH use trend-following; all other top-10 coins use whale/accumulation detection
+TREND_COINS: set = {"BTCUSDT", "ETHUSDT"}
+
+# ML labeling thresholds differ by coin type (mainstream moves less than altcoins)
+ML_LABEL_THRESHOLD_TREND: float = 0.03   # 3% rise = positive label for BTC/ETH
+ML_LABEL_THRESHOLD_WHALE: float = 0.10   # 10% rise = positive label for altcoins
+
+# MAINSTREAM tier trading config (tighter SL/TP for liquid large-cap coins)
+MAINSTREAM_SL_PCT: float = 3.0
+MAINSTREAM_TP_PCT: float = 6.0
+MAINSTREAM_TRAILING_ACTIVATE_PCT: float = 4.0
+MAINSTREAM_TRAILING_DISTANCE_PCT: float = 2.0
+MAINSTREAM_MAX_HOLD_HOURS: float = 72.0
+MAINSTREAM_POSITION_MULTIPLIER: float = 1.0
+
+# Set ML_RESET_ON_STARTUP=true in env for the first deployment after switching coin universe
+ML_RESET_ON_STARTUP: bool = os.getenv("ML_RESET_ON_STARTUP", "false").lower() == "true"
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 控盘检测参数 — 可微调的阈值
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -226,8 +248,8 @@ ORDERBOOK_DEPTH = 20             # 深度档位数
 DB_PATH = "whale_alert.db"
 
 # Web API
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 8888
+WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.getenv("WEB_PORT", "8888"))
 
 # 日志
 LOG_DIR = "logs"

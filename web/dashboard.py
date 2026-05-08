@@ -5,13 +5,13 @@ FastAPI 仪表盘 API — 增强版
 import json
 import time
 import logging
-from typing import Optional
+from typing import Dict, Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from data.data_store import DataStore
-from config import WEB_HOST, WEB_PORT
+from config import TREND_COINS, WATCH_TOKENS, WEB_HOST, WEB_PORT
 
 logger = logging.getLogger(__name__)
 
@@ -19,20 +19,57 @@ app = FastAPI(title="Whale Alert Dashboard", version="4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 store = DataStore()
+CONFIGURED_WATCH_SYMBOLS = frozenset(token.symbol for token in WATCH_TOKENS)
 
 # 延迟初始化, 供外部注入
 _token_manager = None
 _pump_monitor = None
 _scanner = None
 _trader = None
+_top_coins = None
 
 
-def set_managers(token_mgr, pump_mon, scanner=None, trader=None):
-    global _token_manager, _pump_monitor, _scanner, _trader
+def set_managers(token_mgr, pump_mon, scanner=None, trader=None, top_coins=None):
+    global _token_manager, _pump_monitor, _scanner, _trader, _top_coins
     _token_manager = token_mgr
     _pump_monitor = pump_mon
     _scanner = scanner
     _trader = trader
+    _top_coins = top_coins
+
+
+def _get_top_coin_symbols():
+    if _top_coins:
+        return set(_top_coins.get_top_coins())
+    from data.top_coins_fetcher import TopCoinsFetcher
+    return set(TopCoinsFetcher.FALLBACK_LIST)
+
+
+def _build_watch_metadata(symbol: str) -> Dict:
+    top_coins = _get_top_coin_symbols()
+    cfg = next((token for token in WATCH_TOKENS if token.symbol == symbol), None)
+    tags = list(getattr(cfg, "tags", []) or [])
+    is_top_coin = symbol in top_coins
+    is_trend_coin = symbol in TREND_COINS
+    is_configured = symbol in CONFIGURED_WATCH_SYMBOLS
+    if is_top_coin and is_configured:
+        watch_source = "configured+top10"
+    elif is_top_coin:
+        watch_source = "top10"
+    elif is_configured:
+        watch_source = "configured"
+    else:
+        watch_source = "auto"
+
+    return {
+        "strategy": "trend" if is_trend_coin else "whale",
+        "watch_source": watch_source,
+        "is_top_coin": is_top_coin,
+        "is_trend_coin": is_trend_coin,
+        "is_configured_watch": is_configured,
+        "protected_from_auto_removal": bool(is_top_coin or is_configured),
+        "watch_tags": tags,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -47,6 +84,7 @@ async def get_all_tokens():
     for s in snapshots:
         signals = json.loads(s.get("signals_json", "[]")) if s.get("signals_json") else []
         metrics = json.loads(s.get("metrics_json", "{}")) if s.get("metrics_json") else {}
+        metadata = _build_watch_metadata(s["symbol"])
         results.append({
             "symbol": s["symbol"],
             "price": s.get("price", 0),
@@ -57,6 +95,7 @@ async def get_all_tokens():
             "signals": signals,
             "metrics": metrics,
             "timestamp": s.get("timestamp", 0),
+            **metadata,
         })
     return {"tokens": results, "count": len(results)}
 
@@ -109,6 +148,29 @@ async def list_watched_tokens():
         return {"tokens": [], "count": 0}
     tokens = _token_manager.list_tokens()
     return {"tokens": tokens, "count": len(tokens)}
+
+
+@app.get("/api/watchlist")
+async def get_watchlist():
+    watchlist = []
+    for token in WATCH_TOKENS:
+        watchlist.append({
+            "symbol": token.symbol,
+            "name": token.name,
+            "chain": token.chain,
+            "contract": token.contract,
+            "decimals": token.decimals,
+            **_build_watch_metadata(token.symbol),
+        })
+    watchlist.sort(
+        key=lambda token: (
+            not token["is_top_coin"],
+            not token["is_trend_coin"],
+            token["watch_source"] == "auto",
+            token["symbol"],
+        )
+    )
+    return {"watchlist": watchlist, "count": len(watchlist)}
 
 
 @app.post("/api/tokens/batch")
@@ -267,6 +329,7 @@ tr:hover{background:#0c1120}
 .pill.long{background:#00d68f15;color:#00d68f}.pill.short{background:#ff475715;color:#ff4757}
 .pill.open{background:#4a9eff15;color:#4a9eff}.pill.closed{background:#5a6a8a15;color:#5a6a8a}
 .pill.manual{background:#eab30815;color:#eab308}.pill.tp{background:#00d68f15;color:#00d68f}.pill.sl{background:#ff475715;color:#ff4757}
+.pill.protected{background:#eab30815;color:#eab308}
 
 /* Token Cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:10px}
@@ -277,8 +340,19 @@ tr:hover{background:#0c1120}
 .card .sc{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700}
 .sc.critical{background:#ff2d5520;color:#ff2d55}.sc.high{background:#ff9f4320;color:#ff9f43}
 .sc.medium{background:#eab30820;color:#eab308}.sc.low{background:#64748b20;color:#64748b}
+.sc.mainstream{background:#4a9eff20;color:#4a9eff}
 .card .meta{font-size:10px;color:#5a6a8a;line-height:1.7}
 .sig{display:inline-block;font-size:9px;padding:1px 5px;border-radius:3px;margin:1px;background:#ff2d5510;color:#ff6b6b}
+.badge-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700;letter-spacing:.4px;text-transform:uppercase}
+.badge.route-trend{background:#4a9eff18;color:#4a9eff}
+.badge.route-whale{background:#ff6b3518;color:#ff9f43}
+.badge.source-configured{background:#eab30818;color:#eab308}
+.badge.source-top10{background:#00d68f18;color:#00d68f}
+.badge.source-configured-top10{background:#c084fc18;color:#c084fc}
+.badge.source-auto{background:#64748b20;color:#94a3b8}
+.badge.protected{background:#eab30818;color:#facc15}
+.badge.unprotected{background:#64748b20;color:#94a3b8}
 
 /* Bar */
 .dim-bar{display:flex;gap:1px;margin-top:4px}
@@ -308,6 +382,9 @@ tr:hover{background:#0c1120}
 <!-- Tab 1: Overview -->
 <div id="tab-overview" class="tab-content active">
   <div class="stats-row" id="overview-stats"></div>
+  <h3 style="font-size:13px;margin:16px 0 8px;color:#5a6a8a">HYBRID ROUTING</h3>
+  <div class="stats-row" id="route-stats"></div>
+  <table id="hybrid-route-table"><thead><tr><th>Symbol</th><th>Route</th><th>Source</th><th>Protected</th><th>Tags</th></tr></thead><tbody></tbody></table>
   <h3 style="font-size:13px;margin-bottom:8px;color:#5a6a8a">TOP TOKENS BY SCORE</h3>
   <table id="top-tokens-table"><thead><tr><th>Symbol</th><th>Price</th><th>24h</th><th>Score</th><th>Phase</th><th>Pump%</th></tr></thead><tbody></tbody></table>
 </div>
@@ -322,6 +399,7 @@ tr:hover{background:#0c1120}
 
 <!-- Tab 3: Tokens -->
 <div id="tab-tokens" class="tab-content">
+  <div class="stats-row" id="token-route-stats"></div>
   <div class="cards" id="token-cards"></div>
 </div>
 
@@ -385,8 +463,47 @@ function phaseColor(p) {
   return m[p] || '#5a6a8a';
 }
 
-async function loadOverview(tokens) {
+function tierClass(tier) {
+  if (tier === 'mainstream') return 'mainstream';
+  if (tier === 'strong') return 'critical';
+  if (tier === 'medium') return 'high';
+  return 'low';
+}
+
+function tierLabel(tier) {
+  const labels = {mainstream: 'Mainstream', strong: 'Strong', medium: 'Medium', weak: 'Weak'};
+  return labels[tier] || (tier ? tier[0].toUpperCase() + tier.slice(1) : 'Unknown');
+}
+
+function sourceClass(source) {
+  if (source === 'configured+top10') return 'source-configured-top10';
+  if (source === 'configured') return 'source-configured';
+  if (source === 'top10') return 'source-top10';
+  return 'source-auto';
+}
+
+function sourceLabel(source) {
+  const labels = {
+    'configured+top10': 'Configured + Top-10',
+    configured: 'Configured',
+    top10: 'Top-10',
+    auto: 'Auto',
+  };
+  return labels[source] || source || '-';
+}
+
+function routeLabel(strategy) {
+  return strategy === 'trend' ? 'Trend' : 'Whale';
+}
+
+function protectionLabel(isProtected) {
+  return isProtected ? 'Protected' : 'Removable';
+}
+
+async function loadOverview(tokens, watchlist) {
   const statsEl = document.getElementById('overview-stats');
+  const routeStatsEl = document.getElementById('route-stats');
+  const routeTableEl = document.querySelector('#hybrid-route-table tbody');
   const topEl = document.querySelector('#top-tokens-table tbody');
 
   // Fetch trade stats, open positions, & alerts in parallel
@@ -399,15 +516,41 @@ async function loadOverview(tokens) {
   const wr = tradeRes.win_rate || 0;
   const pnl = tradeRes.total_pnl_usd || 0;
   const openCount = openRes.count || 0;
+  const topCoins = watchlist.filter(t => t.is_top_coin);
+  const trendCoins = watchlist.filter(t => t.strategy === 'trend');
+  const protectedCount = watchlist.filter(t => t.protected_from_auto_removal).length;
+  const autoCount = watchlist.filter(t => t.watch_source === 'auto').length;
+  const configuredCount = watchlist.filter(t => t.is_configured_watch).length;
 
   statsEl.innerHTML = `
     <div class="stat-card"><div class="label">Tokens Monitored</div><div class="value blue">${tokens.length}</div></div>
+    <div class="stat-card"><div class="label">Watchlist Size</div><div class="value blue">${watchlist.length}</div><div class="sub">Configured + top-10 + auto</div></div>
     <div class="stat-card"><div class="label">Open Positions</div><div class="value orange">${openCount}</div></div>
     <div class="stat-card"><div class="label">Win Rate</div><div class="value ${wr >= 50 ? 'green' : wr > 0 ? 'red' : 'blue'}">${wr ? wr.toFixed(1) + '%' : 'N/A'}</div></div>
     <div class="stat-card"><div class="label">Total PnL</div><div class="value ${pnl >= 0 ? 'green' : 'red'}">${pnl ? '$' + pnl.toFixed(2) : '$0'}</div></div>
     <div class="stat-card"><div class="label">Alerts (24h)</div><div class="value yellow">${alertRes.count || 0}</div></div>
     <div class="stat-card"><div class="label">Avg PnL/Trade</div><div class="value ${(tradeRes.avg_pnl_pct||0) >= 0 ? 'green' : 'red'}">${tradeRes.avg_pnl_pct ? tradeRes.avg_pnl_pct.toFixed(2) + '%' : 'N/A'}</div></div>
   `;
+
+  routeStatsEl.innerHTML = `
+    <div class="stat-card"><div class="label">Top-10 Route Set</div><div class="value blue">${topCoins.length}</div><div class="sub">Dynamic market-cap list</div></div>
+    <div class="stat-card"><div class="label">Trend Lane</div><div class="value blue">${trendCoins.length}</div><div class="sub">BTC/ETH mainstream routing</div></div>
+    <div class="stat-card"><div class="label">Whale Lane</div><div class="value orange">${watchlist.length - trendCoins.length}</div><div class="sub">Accumulation / control-score path</div></div>
+    <div class="stat-card"><div class="label">Protected Symbols</div><div class="value yellow">${protectedCount}</div><div class="sub">Configured or top-10</div></div>
+    <div class="stat-card"><div class="label">Configured Fallback</div><div class="value yellow">${configuredCount}</div><div class="sub">Never auto-removed</div></div>
+    <div class="stat-card"><div class="label">Auto Discoveries</div><div class="value ${autoCount ? 'orange' : 'blue'}">${autoCount}</div><div class="sub">Eligible for pruning</div></div>
+  `;
+
+  const routeRows = (topCoins.length ? topCoins : watchlist.slice(0, 10));
+  routeTableEl.innerHTML = routeRows.map(t => `
+    <tr>
+      <td style="font-weight:700">${t.symbol}</td>
+      <td><span class="badge route-${t.strategy}">${routeLabel(t.strategy)}</span></td>
+      <td><span class="badge ${sourceClass(t.watch_source)}">${sourceLabel(t.watch_source)}</span></td>
+      <td><span class="badge ${t.protected_from_auto_removal ? 'protected' : 'unprotected'}">${protectionLabel(t.protected_from_auto_removal)}</span></td>
+      <td style="font-size:10px">${(t.watch_tags || []).length ? t.watch_tags.join(', ') : '-'}</td>
+    </tr>
+  `).join('');
 
   // Top 10 tokens table
   const top10 = tokens.slice(0, 10);
@@ -450,12 +593,11 @@ async function loadPositions() {
       }
       const pnlUsd = entry > 0 ? (t.position_size_usd || 200) * pnlPct / 100 : 0;
       const tier = t.signal_tier || 'medium';
-      const tierCls = tier === 'strong' ? 'critical' : tier === 'medium' ? 'high' : 'low';
       const trailing = t.trailing_activated ? `Active` : '-';
       return `<tr>
         <td>#${t.id}</td>
         <td style="font-weight:700">${t.symbol}</td>
-        <td><span class="sc ${tierCls}" style="font-size:10px">${tier.charAt(0).toUpperCase()}</span></td>
+        <td><span class="sc ${tierClass(tier)}" style="font-size:10px">${tierLabel(tier)}</span></td>
         <td><span class="pill ${t.direction}">${t.direction.toUpperCase()}</span></td>
         <td>${fmt$(entry)}</td>
         <td>${cur > 0 ? fmt$(cur) : '-'}</td>
@@ -476,11 +618,10 @@ async function loadPositions() {
     closedTbody.innerHTML = closedTrades.map(t => {
       const dur = t.entry_time && t.exit_time ? (t.exit_time - t.entry_time) / 3600000 : 0;
       const tier = t.signal_tier || 'medium';
-      const tierCls = tier === 'strong' ? 'critical' : tier === 'medium' ? 'high' : 'low';
       return `<tr>
         <td>#${t.id}</td>
         <td>${t.symbol}</td>
-        <td><span class="sc ${tierCls}" style="font-size:10px">${tier.charAt(0).toUpperCase()}</span></td>
+        <td><span class="sc ${tierClass(tier)}" style="font-size:10px">${tierLabel(tier)}</span></td>
         <td><span class="pill ${t.direction}">${t.direction.toUpperCase()}</span></td>
         <td>${fmt$(t.entry_price)}</td>
         <td>${fmt$(t.exit_price)}</td>
@@ -493,8 +634,21 @@ async function loadPositions() {
   }
 }
 
-async function loadTokenCards(tokens) {
+async function loadTokenCards(tokens, watchlist) {
+  const statsEl = document.getElementById('token-route-stats');
   const el = document.getElementById('token-cards');
+  const topCoinTokens = tokens.filter(t => t.is_top_coin).length;
+  const trendTokens = tokens.filter(t => t.strategy === 'trend').length;
+  const protectedTokens = tokens.filter(t => t.protected_from_auto_removal).length;
+  const autoTokens = watchlist.filter(t => t.watch_source === 'auto').length;
+
+  statsEl.innerHTML = `
+    <div class="stat-card"><div class="label">Top-10 Snapshots</div><div class="value blue">${topCoinTokens}</div></div>
+    <div class="stat-card"><div class="label">Trend Snapshots</div><div class="value blue">${trendTokens}</div><div class="sub">BTC / ETH</div></div>
+    <div class="stat-card"><div class="label">Protected Snapshots</div><div class="value yellow">${protectedTokens}</div></div>
+    <div class="stat-card"><div class="label">Auto Watchlist</div><div class="value ${autoTokens ? 'orange' : 'blue'}">${autoTokens}</div><div class="sub">Discovery-managed</div></div>
+  `;
+
   el.innerHTML = tokens.map(t => {
     const cls = t.control_score >= 70 ? 'critical' : t.control_score >= 50 ? 'high' : '';
     const sCls = scoreClass(t.control_score);
@@ -525,6 +679,11 @@ async function loadTokenCards(tokens) {
       <div class="meta">
         ${fmt$(t.price)} ${chg} | ${t.phase ? t.phase : '-'} | Pump ${t.pump_probability || 0}%
       </div>
+      <div class="badge-row">
+        <span class="badge route-${t.strategy}">${routeLabel(t.strategy)}</span>
+        <span class="badge ${sourceClass(t.watch_source)}">${sourceLabel(t.watch_source)}</span>
+        <span class="badge ${t.protected_from_auto_removal ? 'protected' : 'unprotected'}">${protectionLabel(t.protected_from_auto_removal)}</span>
+      </div>
       <div style="display:flex;gap:1px;margin-top:4px">${bars}</div>
       <div style="margin-top:4px">${sigs}</div>
     </div>`;
@@ -554,7 +713,10 @@ async function loadStats() {
   if (tradeRes.by_tier) {
     const tiers = tradeRes.by_tier;
     tsEl.innerHTML += [
-      ['Strong', tiers.strong, 'critical'], ['Medium', tiers.medium, 'high'], ['Weak', tiers.weak, 'low']
+      ['Mainstream', tiers.mainstream, 'mainstream'],
+      ['Strong', tiers.strong, 'critical'],
+      ['Medium', tiers.medium, 'high'],
+      ['Weak', tiers.weak, 'low']
     ].map(([name, t, cls]) =>
       `<div class="stat-card"><div class="label">${name} Tier</div><div class="value" style="font-size:16px"><span class="sc ${cls}">${t ? t.trades : 0}</span> ${t && t.trades ? t.win_rate.toFixed(0) + '%WR' : '-'}</div></div>`
     ).join('');
@@ -612,15 +774,24 @@ async function closeTrade(id, symbol) {
 
 async function loadAll() {
   try {
-    const tokensRes = await fetch(API + '/api/tokens');
-    const tokensData = await tokensRes.json();
-    const tokens = (tokensData.tokens || []).sort((a, b) => b.control_score - a.control_score);
+    const [tokensRes, watchlistRes] = await Promise.all([
+      fetch(API + '/api/tokens').then(r => r.json()),
+      fetch(API + '/api/watchlist').then(r => r.json()).catch(() => ({watchlist: []}))
+    ]);
+    const watchlist = watchlistRes.watchlist || [];
+    const tokens = (tokensRes.tokens || []).sort((a, b) => {
+      if (a.is_top_coin !== b.is_top_coin) return a.is_top_coin ? -1 : 1;
+      if (a.is_trend_coin !== b.is_trend_coin) return a.is_trend_coin ? -1 : 1;
+      return b.control_score - a.control_score;
+    });
+    const protectedCount = watchlist.filter(t => t.protected_from_auto_removal).length;
+    const topCoinCount = watchlist.filter(t => t.is_top_coin).length;
 
     document.getElementById('status-text').textContent =
-      `${tokens.length} tokens | ${new Date().toLocaleTimeString()}`;
+      `${tokens.length} snapshots | ${watchlist.length} watchlist | ${topCoinCount} top-10 | ${protectedCount} protected | ${new Date().toLocaleTimeString()}`;
 
-    loadOverview(tokens);
-    loadTokenCards(tokens);
+    loadOverview(tokens, watchlist);
+    loadTokenCards(tokens, watchlist);
 
     // Only load heavy data when tab is active
     if (currentTab === 'positions') loadPositions();

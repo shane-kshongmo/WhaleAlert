@@ -18,6 +18,7 @@ class SignalTier(Enum):
     STRONG = "strong"      # score >= 65
     MEDIUM = "medium"      # score >= 53 (raised from 50 for better quality)
     WEAK = "weak"          # score >= 40 (minimum to trade)
+    MAINSTREAM = "mainstream"  # top-10 trend coins (BTC/ETH) — tight SL/TP
 
 
 @dataclass
@@ -51,6 +52,11 @@ TIER_CONFIGS = {
         sl_pct=8.0, tp_pct=12.0,
         trailing_activate_pct=6.0, trailing_distance_pct=5.0,   # unchanged (already widest)
         max_hold_hours=36.0, position_size_multiplier=2.0,       # was 1.0 — best performers get more
+    ),
+    SignalTier.MAINSTREAM: TierConfig(
+        sl_pct=3.0, tp_pct=6.0,                                  # tighter: large-caps move less
+        trailing_activate_pct=4.0, trailing_distance_pct=2.0,
+        max_hold_hours=72.0, position_size_multiplier=1.0,
     ),
 }
 
@@ -118,7 +124,8 @@ class TradeData:
         return data
 
 
-def classify_tier(control_score: int, pump_probability: int = 0) -> SignalTier:
+def classify_tier(control_score: int, pump_probability: int = 0,
+                  symbol: str = "") -> SignalTier:
     """Classify signal strength into a tier
 
     Performance data (2026-04-12):
@@ -126,8 +133,11 @@ def classify_tier(control_score: int, pump_probability: int = 0) -> SignalTier:
     - Score 53-65 (old MEDIUM): 40% win rate
     - Score 40-53 (old WEAK): 60% win rate - best performers!
 
-    Strategy: Invert tier logic to align with reality
+    Top-10 trend coins (BTC/ETH) always use MAINSTREAM tier regardless of score.
     """
+    from config import TREND_COINS
+    if symbol and symbol in TREND_COINS:
+        return SignalTier.MAINSTREAM
     if control_score >= 70:
         return SignalTier.STRONG     # Only extreme scores (was 65, raised to 70)
     elif control_score >= 55:        # Raised from 53 (medium tier needs more room)
@@ -258,8 +268,12 @@ class PaperTrader:
             alert_data.get("crash_probability", alert_data.get("probability", 0))
         )
 
-        # Check minimum alert score
-        if alert_score < self.config.min_alert_score:
+        # Determine signal tier before applying legacy score floors so BTC/ETH
+        # trend alerts can use the dedicated mainstream lane.
+        tier = classify_tier(alert_score, alert_probability, symbol=symbol)
+
+        # Check minimum alert score for non-mainstream signals
+        if tier != SignalTier.MAINSTREAM and alert_score < self.config.min_alert_score:
             logger.info(f"[PaperTrader] Alert score {alert_score} below minimum {self.config.min_alert_score}")
             return None
 
@@ -268,9 +282,6 @@ class PaperTrader:
             logger.info(
                 f"[PaperTrader] Volume too low: {symbol} ${volume_24h:,.0f} < ${self.config.min_volume_24h:,.0f}")
             return None
-
-        # Determine signal tier
-        tier = classify_tier(alert_score, alert_probability)
 
         # STRONG tier disabled: 0% win rate empirically (2026-04-14)
         # High-score signals appear to fire at market tops, not accumulation bottoms.
@@ -528,7 +539,8 @@ class PaperTrader:
     def _check_trailing_stop(self, trade: TradeData, current_price: float,
                               price_change_pct: float, conn) -> Optional[str]:
         """Check and update trailing stop logic"""
-        tier = SignalTier(trade.signal_tier) if trade.signal_tier in ("strong", "medium", "weak") else SignalTier.MEDIUM
+        valid_tiers = {t.value for t in SignalTier}
+        tier = SignalTier(trade.signal_tier) if trade.signal_tier in valid_tiers else SignalTier.MEDIUM
         tier_cfg = self._get_tier_params(tier)
 
         # Track the most favorable price seen so far:

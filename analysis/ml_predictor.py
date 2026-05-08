@@ -104,9 +104,12 @@ FEATURE_NAMES = [
     "rt_volume_surge_5m",   # 5分钟成交量突增
     "rt_price_change_5m",   # 5分钟价格变化
     "rt_bid_ask_imbalance", # 买卖盘不平衡 (实时)
+
+    # ── 代币类型 ──
+    "coin_type",            # 0.0=whale strategy, 1.0=trend strategy (BTC/ETH)
 ]
 
-NUM_FEATURES = 47
+NUM_FEATURES = 48
 
 
 def extract_features(
@@ -117,6 +120,7 @@ def extract_features(
     btc_data: dict = None,
     pump_history: dict = None,
     realtime_metrics: dict = None,  # realtime_engine metrics
+    coin_type: str = "whale",       # "whale" or "trend" (BTC/ETH)
 ) -> np.ndarray:
     """
     从各模块的输出中提取统一特征向量
@@ -263,6 +267,9 @@ def extract_features(
         float(rt_volume_surge_5m),
         float(rt_price_change_5m),
         float(rt_bid_ask_imbalance),
+
+        # 代币类型
+        1.0 if coin_type == "trend" else 0.0,
     ], dtype=np.float32)
 
     # 处理 NaN/Inf
@@ -1112,14 +1119,21 @@ class PredictionManager:
                     features_json TEXT,
                     entry_price REAL,
                     created_at INTEGER,
-                    labeled INTEGER DEFAULT 0
+                    labeled INTEGER DEFAULT 0,
+                    coin_type TEXT DEFAULT 'whale'
                 );
             """)
+            # Migration: add coin_type column to existing tables
+            try:
+                conn.execute("ALTER TABLE pending_ml_samples ADD COLUMN coin_type TEXT DEFAULT 'whale'")
+            except Exception:
+                pass  # column already exists
 
     # ── 延迟标签系统 (P0-1: 修复循环标签) ────────────────────────────────
 
     def save_ml_sample_pending(self, symbol: str, features: np.ndarray,
-                                entry_price: float, timestamp: int = 0):
+                                entry_price: float, timestamp: int = 0,
+                                coin_type: str = "whale"):
         """
         保存待标签样本 - 标签将在24小时后通过前向价格验证生成
 
@@ -1136,9 +1150,9 @@ class PredictionManager:
         with self.store._conn() as conn:
             conn.execute("""
                 INSERT INTO pending_ml_samples
-                (symbol, timestamp, features_json, entry_price, created_at, labeled)
-                VALUES (?, ?, ?, ?, ?, 0)
-            """, (symbol, timestamp, json.dumps(features.tolist()), entry_price, now))
+                (symbol, timestamp, features_json, entry_price, created_at, labeled, coin_type)
+                VALUES (?, ?, ?, ?, ?, 0, ?)
+            """, (symbol, timestamp, json.dumps(features.tolist()), entry_price, now, coin_type))
 
     def label_pending_samples(self, older_than_hours: int = 24) -> int:
         """
@@ -1161,7 +1175,8 @@ class PredictionManager:
         with self.store._conn() as conn:
             # 获取所有需要标签的样本
             rows = conn.execute("""
-                SELECT id, symbol, timestamp, features_json, entry_price
+                SELECT id, symbol, timestamp, features_json, entry_price,
+                       COALESCE(coin_type, 'whale') AS coin_type
                 FROM pending_ml_samples
                 WHERE labeled = 0 AND timestamp < ?
             """, (cutoff_time_ms,)).fetchall()
@@ -1172,6 +1187,7 @@ class PredictionManager:
                 timestamp = row["timestamp"]
                 features = json.loads(row["features_json"])
                 entry_price = row["entry_price"]
+                coin_type = row["coin_type"]
 
                 # 获取当前价格 (从 indicators 或通过 API)
                 # 这里简化处理 - 实际应该调用 Binance API 获取最新价格
@@ -1179,9 +1195,11 @@ class PredictionManager:
                 if current_price is None:
                     continue
 
-                # 计算实际涨跌幅
+                # 计算实际涨跌幅 — threshold varies by coin type
+                from config import ML_LABEL_THRESHOLD_TREND, ML_LABEL_THRESHOLD_WHALE
+                threshold = ML_LABEL_THRESHOLD_TREND if coin_type == "trend" else ML_LABEL_THRESHOLD_WHALE
                 actual_change = (current_price - entry_price) / entry_price if entry_price > 0 else 0
-                label = 1 if actual_change >= 0.10 else 0  # 10% threshold (was 30% — too rare)
+                label = 1 if actual_change >= threshold else 0
 
                 # Positive samples are rare; upweight them to counteract class imbalance
                 weight = 4.0 if label == 1 else 1.0
@@ -1230,7 +1248,8 @@ class PredictionManager:
     # ── 预测 (对外接口) ──────────────────────────────────────────────────
 
     def predict(self, indicators, whale_analysis, onchain=None,
-                historical_scores=None, btc_data=None, pump_history=None) -> Dict:
+                historical_scores=None, btc_data=None, pump_history=None,
+                coin_type: str = "whale") -> Dict:
         """
         综合预测: ML + 规则引擎
 
@@ -1243,7 +1262,8 @@ class PredictionManager:
         }
         """
         features = extract_features(indicators, whale_analysis, onchain,
-                                    historical_scores, btc_data, pump_history)
+                                    historical_scores, btc_data, pump_history,
+                                    coin_type=coin_type)
 
         if self.predictor.is_ready():
             result = self.predictor.predict(features)
@@ -1299,7 +1319,7 @@ class PredictionManager:
             try:
                 features = np.array(json.loads(r["features_json"]), dtype=np.float32)
                 # Accept old (30, 41, 42) or new (47) feature samples
-                if len(features) in (30, 41, 42, NUM_FEATURES):
+                if len(features) in (30, 41, 42, 47, NUM_FEATURES):
                     samples.append(TrainingSample(
                         symbol=r["symbol"],
                         timestamp=r["timestamp"],
@@ -1347,6 +1367,24 @@ class PredictionManager:
                       json.dumps(metrics), len(samples), int(now * 1000)))
 
         return metrics
+
+    def reset_training_data(self):
+        """清除所有训练样本和模型 (切换代币宇宙时使用)"""
+        with self.store._conn() as conn:
+            conn.execute("DELETE FROM ml_training_samples")
+            conn.execute("DELETE FROM pending_ml_samples")
+        self._sample_cache = []
+        self._last_train_time = 0
+        self.predictor._is_trained = False
+        self.predictor._model = None
+        if hasattr(self.predictor, "_model_recent"):
+            self.predictor._model_recent = None
+        if hasattr(self.predictor, "_model_highconf"):
+            self.predictor._model_highconf = None
+        self.predictor._model_version = 0
+        if os.path.exists(self._model_path):
+            os.remove(self._model_path)
+        logger.warning("[ML] 训练数据已重置 — 所有样本清除, 模型已删除")
 
     # ── NN 切换 ──────────────────────────────────────────────────────────
 

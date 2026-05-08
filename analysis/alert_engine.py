@@ -102,7 +102,13 @@ class AlertEngine:
         for sym in expired:
             del self._watchlist[sym]
 
-    def evaluate(self, analysis: WhaleAnalysis, score_boost: int = 0, ml_confidence: str = "medium") -> AlertDecision:
+    def evaluate(self, analysis: WhaleAnalysis, score_boost: int = 0,
+                 ml_confidence: str = "medium", coin_strategy: str = "whale",
+                 indicators=None) -> AlertDecision:
+        # Route BTC/ETH to trend-following evaluator; all others use whale detection
+        if coin_strategy == "trend":
+            return self._evaluate_trend_signal(analysis, indicators)
+
         decision = AlertDecision(symbol=analysis.symbol, analysis=analysis)
         symbol = analysis.symbol
 
@@ -202,7 +208,105 @@ class AlertEngine:
         big_move = sum(1 for a in analyses if abs(a.change_24h) > 5)
         return max(high_control / total, big_move / total)
 
-    def evaluate_batch(self, analyses: List[WhaleAnalysis]) -> List[AlertDecision]:
+    def _evaluate_trend_signal(self, analysis: WhaleAnalysis, indicators=None) -> AlertDecision:
+        """
+        趋势跟踪信号评估 — 用于 BTC/ETH 等基本面驱动的主流大币
+        需要 4 个趋势信号中的至少 2 个, 且拉盘概率 ≥ 20%
+        """
+        decision = AlertDecision(symbol=analysis.symbol, analysis=analysis)
+        symbol = analysis.symbol
+
+        last_alert_ts = self.store.get_last_alert_time(symbol)
+        if last_alert_ts:
+            hours_since = (time.time() * 1000 - last_alert_ts) / 3600000
+            if hours_since < AC.cooldown_hours:
+                decision.reason = f"冷却中: {hours_since:.1f}h"
+                return decision
+
+        signals_hit = 0
+        signal_details = []
+
+        if indicators:
+            # Signal 1: EMA多头排列 (EMA20 > EMA50 > EMA200)
+            if (indicators.ema20 > 0 and indicators.ema50 > 0 and indicators.ema200 > 0
+                    and indicators.ema20 > indicators.ema50 > indicators.ema200):
+                signals_hit += 1
+                signal_details.append("EMA多头排列(20>50>200)")
+
+            # Signal 2: RSI突破50向上 (50-70区间表示新鲜上行动量)
+            if 50 <= indicators.rsi_14 <= 70:
+                signals_hit += 1
+                signal_details.append(f"RSI突破50({indicators.rsi_14:.1f})")
+
+            # Signal 3: 量能确认 (成交量 ≥ 1.5x 均值)
+            if indicators.vol_spike_ratio >= 1.5:
+                signals_hit += 1
+                signal_details.append(f"量能确认({indicators.vol_spike_ratio:.1f}x)")
+
+            # Signal 4: MACD金叉 (柱状图 > 0 且 MACD > 0)
+            if indicators.macd_histogram > 0 and indicators.macd > 0:
+                signals_hit += 1
+                signal_details.append("MACD金叉")
+
+        if signals_hit < 2:
+            decision.reason = f"趋势信号不足: {signals_hit}/4 < 2"
+            return decision
+
+        if analysis.pump_probability < 20:
+            decision.reason = f"趋势概率不足: {analysis.pump_probability}% < 20%"
+            return decision
+
+        # 2-stage confirmation (reuse same watchlist)
+        self._cleanup_watchlist()
+        now = time.time()
+        existing = self._watchlist.get(symbol)
+        if existing is None:
+            self._watchlist[symbol] = {"added_at": now, "scan_count": 1, "last_score": signals_hit * 25}
+            decision.reason = f"趋势Stage1: 观察中 ({signals_hit}/4信号)"
+            logger.info(f"[Trend] {symbol}: Stage1 score={signals_hit}/4 prob={analysis.pump_probability}%")
+            return decision
+
+        del self._watchlist[symbol]
+
+        decision.should_alert = True
+        decision.urgency = "high"
+        decision.reason = "趋势信号确认"
+        decision.trade_signal = {
+            "stop_loss_pct": 3.0,
+            "take_profit_pct": 6.0,
+            "risk_reward": 2.0,
+            "direction": "long",
+        }
+        decision.message = self._build_trend_message(analysis, signals_hit, signal_details, indicators)
+        logger.warning(f"📈 [TREND ALERT] {symbol}: {signals_hit}/4信号, prob={analysis.pump_probability}%")
+        return decision
+
+    def _build_trend_message(self, a: WhaleAnalysis, signals_hit: int,
+                              signal_details: list, indicators=None) -> str:
+        rsi_str = f"{indicators.rsi_14:.1f}" if indicators else "n/a"
+        vol_str = f"{indicators.vol_spike_ratio:.1f}x" if indicators else "n/a"
+        details_str = "\n".join(f"  ✅ {s}" for s in signal_details)
+        return f"""📈 趋势跟踪预警 📈
+
+━━━━━━━━━━━━━━━━━━━
+🚀 {a.symbol} — 趋势突破
+━━━━━━━━━━━━━━━━━━━
+
+💰 价格: ${a.price:,.4f}
+📈 24h: {a.change_24h:+.2f}%
+
+🎯 趋势信号: {signals_hit}/4
+📊 RSI: {rsi_str}  量能: {vol_str}
+── 触发信号 ──
+{details_str}
+
+🛑 止损: -3.0%  🎯 目标: +6.0%
+⚠️ 趋势跟踪有风险, 不构成投资建议
+━━━━━━━━━━━━━━━━━━━""".strip()
+
+    def evaluate_batch(self, analyses: List[WhaleAnalysis],
+                       strategy_map: Dict[str, str] = None,
+                       indicators_map: Dict = None) -> List[AlertDecision]:
         # 过滤稳定币
         analyses = [a for a in analyses if a.symbol not in STABLECOIN_SYMBOLS]
         correlation = self._check_market_correlation(analyses)
@@ -212,7 +316,10 @@ class AlertEngine:
 
         results = []
         for a in analyses:
-            decision = self.evaluate(a, score_boost=score_boost)
+            strategy = (strategy_map or {}).get(a.symbol, "whale")
+            ind = (indicators_map or {}).get(a.symbol)
+            decision = self.evaluate(a, score_boost=score_boost,
+                                     coin_strategy=strategy, indicators=ind)
             if decision.should_alert:
                 results.append(decision)
                 self.store.save_alert({

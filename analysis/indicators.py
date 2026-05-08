@@ -43,6 +43,9 @@ class IndicatorResult:
     sma60: float = 0
     ema12: float = 0
     ema26: float = 0
+    ema20: float = 0
+    ema50: float = 0
+    ema200: float = 0
     macd: float = 0
     macd_signal: float = 0
     macd_histogram: float = 0
@@ -230,14 +233,23 @@ def calc_indicators(klines: List, symbol: str = "") -> IndicatorResult:
     # ── EMA + MACD ──
     ema12 = closes[0]
     ema26 = closes[0]
+    ema20 = closes[0]
+    ema50 = closes[0]
+    ema200 = closes[0]
     signal = 0
     for c in closes:
         ema12 = c * (2 / 13) + ema12 * (1 - 2 / 13)
         ema26 = c * (2 / 27) + ema26 * (1 - 2 / 27)
+        ema20 = c * (2 / 21) + ema20 * (1 - 2 / 21)
+        ema50 = c * (2 / 51) + ema50 * (1 - 2 / 51)
+        ema200 = c * (2 / 201) + ema200 * (1 - 2 / 201)
         macd_val = ema12 - ema26
         signal = macd_val * (2 / 10) + signal * (1 - 2 / 10)
     result.ema12 = ema12
     result.ema26 = ema26
+    result.ema20 = ema20
+    result.ema50 = ema50
+    result.ema200 = ema200
     result.macd = ema12 - ema26
     result.macd_signal = signal
     result.macd_histogram = result.macd - signal

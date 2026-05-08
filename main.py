@@ -16,13 +16,14 @@ import threading
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
-from config import WATCH_TOKENS, SCAN_INTERVAL_MINUTES, KLINE_INTERVAL
+from config import WATCH_TOKENS, SCAN_INTERVAL_MINUTES, KLINE_INTERVAL, ML_RESET_ON_STARTUP
 from data.binance_client import BinanceClient
 from data.realtime_engine import RealtimeEngine
 from data.onchain_client import OnchainClient
 from data.data_store import DataStore
 from data.token_manager import TokenManager
 from data.auto_discovery import AutoDiscoveryScanner
+from data.top_coins_fetcher import TopCoinsFetcher
 from analysis.indicators import calc_indicators
 from analysis.ml_predictor import PredictionManager, extract_features
 from analysis.whale_detector import WhaleDetector, WhaleAnalysis, CrashDetector, CrashAnalysis
@@ -49,7 +50,8 @@ class WhaleAlertService:
         self.pump_monitor = PumpMonitor(self.store)
         self.learning_engine = LearningEngine(self.store, self.pump_monitor)
         self.token_manager = TokenManager(self.store)
-        self.scanner = AutoDiscoveryScanner(self.store)
+        self.top_coins = TopCoinsFetcher()
+        self.scanner = AutoDiscoveryScanner(self.store, top_coins_fetcher=self.top_coins)
         self.ml = PredictionManager(self.store, model_type="gbdt")
         self.telegram = TelegramBot()
         self.webhook = WebhookNotifier()
@@ -60,8 +62,16 @@ class WhaleAlertService:
         self._scan_count = 0
         self._feature_cache: Dict = {}
         self._prev_prices: Dict[str, float] = {}  # for breakout detection
+        self._indicators_cache: Dict = {}          # per-symbol IndicatorResult for trend signals
+        self._strategy_cache: Dict[str, str] = {}  # per-symbol "whale" or "trend"
+        self._top_coins_last_refresh: float = 0
 
         self.learning_engine.restore_learned_thresholds()
+
+        if ML_RESET_ON_STARTUP:
+            logger.warning("[Init] ML_RESET_ON_STARTUP=true — 清除训练数据和模型")
+            self.ml.reset_training_data()
+
         logger.info(f"[Init] 代币:{self.token_manager.get_token_count()} ML:{self.ml.predictor.is_ready()}")
 
     # ══════════════════════════════════════════════════════════════════
@@ -142,8 +152,13 @@ class WhaleAlertService:
                         orderbook_ratio=ob_r, trade_buy_ratio=tr_b, timestamp=ts,
                         funding_rate=funding)
 
+                    # Cache indicators and determine coin strategy for alert routing
+                    self._indicators_cache[sym] = ind
+                    coin_strategy = self.top_coins.get_coin_strategy(sym)
+                    self._strategy_cache[sym] = coin_strategy
+
                     # ML校正
-                    ml = self.ml.predict(ind, whale, oc)
+                    ml = self.ml.predict(ind, whale, oc, coin_type=coin_strategy)
                     if ml["source"] != "rule":
                         # Blend: use max of rule-based and ML probability
                         # Avoids ML model returning 0 and overriding valid rule-based estimate
@@ -159,7 +174,8 @@ class WhaleAlertService:
                             symbol=sym,
                             features=ml["features"],
                             entry_price=whale.price,
-                            timestamp=ts
+                            timestamp=ts,
+                            coin_type=coin_strategy,
                         )
                     except Exception as e:
                         logger.debug(f"[ML] Failed to save pending sample for {sym}: {e}")
@@ -207,7 +223,11 @@ class WhaleAlertService:
         # STEP 2: 预警 — 暴涨 + 暴跌 并行
         # ══════════════════════════════════════════════════════════════
         async def _pump_alerts():
-            als = self.alert_engine.evaluate_batch(all_whales)
+            strategy_map = {a.symbol: self._strategy_cache.get(a.symbol, "whale") for a in all_whales}
+            indicators_map = {a.symbol: self._indicators_cache.get(a.symbol) for a in all_whales}
+            als = self.alert_engine.evaluate_batch(all_whales,
+                                                    strategy_map=strategy_map,
+                                                    indicators_map=indicators_map)
             for a in als:
                 await self.telegram.send_alert(a.message)
                 await self.webhook.send(a.message)
@@ -468,7 +488,14 @@ class WhaleAlertService:
                 )
 
                 # 评估预警
-                pump_alerts = self.alert_engine.evaluate_batch([whale])
+                coin_strategy = self.top_coins.get_coin_strategy(symbol)
+                self._strategy_cache[symbol] = coin_strategy
+                self._indicators_cache[symbol] = ind
+                pump_alerts = self.alert_engine.evaluate_batch(
+                    [whale],
+                    strategy_map={symbol: coin_strategy},
+                    indicators_map={symbol: ind},
+                )
                 for a in pump_alerts:
                     await self.telegram.send_alert(a.message + f"\n{signal_info}")
                     await self.webhook.send(a.message)
@@ -509,11 +536,39 @@ class WhaleAlertService:
     # 生命周期
     # ══════════════════════════════════════════════════════════════════
 
+    def _sync_top_coins_to_watchlist(self):
+        """Add current top-10 coins to WATCH_TOKENS if not already present."""
+        existing_symbols = {t.symbol for t in WATCH_TOKENS}
+        added_symbols = []
+        for tc in self.top_coins.to_token_configs():
+            if tc.symbol not in existing_symbols:
+                WATCH_TOKENS.append(tc)
+                existing_symbols.add(tc.symbol)
+                added_symbols.append(tc.symbol)
+                logger.info(f"[TopCoins] Added {tc.symbol} to watchlist")
+        return added_symbols
+
+    async def _refresh_top_coins_watchlist(self):
+        """Refresh the top-10 cache and subscribe realtime feeds for new members."""
+        new_top = await self.top_coins.refresh()
+        self._top_coins_last_refresh = time.time()
+        added_symbols = self._sync_top_coins_to_watchlist()
+        if added_symbols:
+            await self.realtime.subscribe(added_symbols)
+            logger.info(f"[TopCoins] Realtime subscribed: {added_symbols}")
+        logger.info(f"[TopCoins] 24h刷新完成: {new_top}")
+        return new_top
+
     async def run_loop(self):
         logger.info(
             f"🐋 Whale Alert v4 启动\n"
             f"  📡 {self.token_manager.get_token_count()}代币 ⏱{SCAN_INTERVAL_MINUTES}min\n"
             f"  🚀 涨≥30%/24h 📉 跌≥50%/4h 🔄 并行执行")
+
+        # Fetch top-10 coins on startup
+        await self.top_coins.refresh()
+        self._top_coins_last_refresh = time.time()
+        self._sync_top_coins_to_watchlist()
 
         # 启动实时引擎
         symbols = [t.symbol for t in WATCH_TOKENS]
@@ -532,6 +587,10 @@ class WhaleAlertService:
 
                 if self._running:
                     await self.check_fast_signals()
+
+                # Refresh top-10 list every 24h
+                if time.time() - self._top_coins_last_refresh >= 86400 and self._running:
+                    await self._refresh_top_coins_watchlist()
 
                 if elapsed_since_scan >= scan_interval_secs and self._running:
                     elapsed_since_scan = 0
@@ -558,7 +617,13 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: service.stop())
 
     from web.dashboard import start_dashboard, set_managers
-    set_managers(service.token_manager, service.pump_monitor, service.scanner, service.trader)
+    set_managers(
+        service.token_manager,
+        service.pump_monitor,
+        service.scanner,
+        service.trader,
+        service.top_coins,
+    )
     threading.Thread(target=start_dashboard, daemon=True).start()
     logger.info(f"📊 Dashboard: http://localhost:8888")
 

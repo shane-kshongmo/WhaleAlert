@@ -31,6 +31,9 @@ from data.data_store import DataStore
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://data-api.binance.vision"
+# Snapshot the statically configured watchlist at import time so later
+# auto-discovered or top-10 additions do not become "manual" implicitly.
+CONFIGURED_WATCH_SYMBOLS = frozenset(t.symbol for t in WATCH_TOKENS)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -43,7 +46,7 @@ class DiscoveryConfig:
 
     # Level 1: 基础过滤
     min_quote_volume_24h: float = 500_000     # 最低 24h 成交额 (USDT)
-    max_quote_volume_24h: float = 5_000_000_000  # 排除 BTC/ETH 等巨鲸 (50亿)
+    max_quote_volume_24h: float = 500_000_000_000  # 允许 BTC/ETH 等大市值代币通过
     excluded_bases: Set[str] = field(default_factory=lambda: {
         # 稳定币 (法币锚定 + 加密锚定)
         "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDD", "USDP",
@@ -55,8 +58,8 @@ class DiscoveryConfig:
         "BTTC",
     })
     excluded_symbols: Set[str] = field(default_factory=lambda: {
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",   # 大盘, 不可能被控盘
-        "ADAUSDT", "DOTUSDT", "AVAXUSDT", "LINKUSDT", "MATICUSDT",
+        # Only exclude wrapped/derivative versions — top-10 coins are now monitored directly
+        "BTCBUSDT",   # BTCB (wrapped BTC on BSC)
     })
 
     # Level 2: 行情预筛 (这些信号提示"值得关注")
@@ -104,9 +107,10 @@ class TickerSnapshot:
 class AutoDiscoveryScanner:
     """自动发现扫描器"""
 
-    def __init__(self, store: DataStore):
+    def __init__(self, store: DataStore, top_coins_fetcher=None):
         self.store = store
         self.cfg = DISCOVERY_CONFIG
+        self._top_fetcher = top_coins_fetcher
         self._init_table()
         self._last_scan_time = 0
         self._all_usdt_pairs: List[str] = []
@@ -150,6 +154,14 @@ class AutoDiscoveryScanner:
         tickers = await self._fetch_all_tickers()
         candidates = self._level2_filter(tickers)
         logger.info(f"[Discovery] Level 2: 筛选出 {len(candidates)} 个候选")
+
+        # Guarantee top-10 coins are always in candidates (high-priority slots)
+        if self._top_fetcher:
+            candidate_syms = {c.symbol for c in candidates}
+            for sym in self._top_fetcher.get_top_coins():
+                if sym not in candidate_syms and sym in tickers:
+                    candidates.insert(0, tickers[sym])
+                    candidate_syms.add(sym)
 
         # Level 3: 整合到 WATCH_TOKENS
         result = self._level3_promote(candidates, tickers)
@@ -382,15 +394,10 @@ class AutoDiscoveryScanner:
                 manual = {r["symbol"] for r in rows}
             except Exception:
                 manual = set()
-        # config.py 里写死的也是手动的
-        hardcoded = {
-            "PEPEUSDT", "WIFUSDT", "FLOKIUSDT", "BONKUSDT", "SHIBUSDT",
-            "DOGEUSDT", "TURBOUSDT", "NEIROUSDT", "NOTUSDT", "SUIUSDT",
-            "TIAUSDT", "FETUSDT", "INJUSDT", "ARBUSDT", "OPUSDT",
-            "APEUSDT", "GALAUSDT", "IMXUSDT", "BLURUSDT", "ORDIUSDT",
-            "1000SATSUSDT", "PEOPLEUSDT", "LUNCUSDT",
-        }
-        return manual | hardcoded
+        # Top-10 coins are permanent — never auto-removed
+        from data.top_coins_fetcher import TopCoinsFetcher
+        top10 = set(TopCoinsFetcher.FALLBACK_LIST)
+        return manual | CONFIGURED_WATCH_SYMBOLS | top10
 
     def _infer_tags(self, t: TickerSnapshot) -> List[str]:
         """根据 ticker 特征推断标签"""
